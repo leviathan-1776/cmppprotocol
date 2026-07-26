@@ -8,15 +8,17 @@
 //! [`CmppConnection::take_events`] 返回的 channel 作为 [`Event`] 送达。
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
@@ -30,6 +32,11 @@ use crate::types::{
     CODEC_INITIAL_CAPACITY, INCOMING_CHANNEL_CAPACITY, SEND_CHANNEL_CAPACITY,
     TIMEOUT_CHECK_IDLE_INTERVAL, TIMEOUT_CHECK_INTERVAL,
 };
+
+const EVENT_SPOOL_NORMAL_CAPACITY: usize = 256;
+const EVENT_SPOOL_EMERGENCY_CAPACITY: usize = 2;
+const CONTROL_CHANNEL_CAPACITY: usize = 64;
+const CONTROL_BURST_LIMIT: usize = 16;
 
 /// [`CmppConnection`] 产生的 async event。
 ///
@@ -64,25 +71,215 @@ impl Event {
     }
 }
 
+enum EventSpoolItem {
+    Event {
+        event_rx: oneshot::Receiver<Event>,
+        _depth_permit: EventDepthPermit,
+    },
+    Terminal {
+        reason: Option<Error>,
+        _depth_permit: EventDepthPermit,
+    },
+}
+
+struct EventDepthPermit {
+    depth: Arc<AtomicUsize>,
+}
+
+impl EventDepthPermit {
+    fn new(depth: Arc<AtomicUsize>) -> Self {
+        depth.fetch_add(1, Ordering::SeqCst);
+        EventDepthPermit { depth }
+    }
+}
+
+impl Drop for EventDepthPermit {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct EventTicketTracker {
+    pending_tx: watch::Sender<usize>,
+}
+
+struct EventTicketGuard {
+    tracker: Arc<EventTicketTracker>,
+}
+
+impl EventTicketGuard {
+    fn new(tracker: Arc<EventTicketTracker>) -> Self {
+        tracker.pending_tx.send_modify(|pending| *pending += 1);
+        EventTicketGuard { tracker }
+    }
+}
+
+impl Drop for EventTicketGuard {
+    fn drop(&mut self) {
+        self.tracker.pending_tx.send_modify(|pending| *pending -= 1);
+    }
+}
+
+struct EventTicket {
+    event_tx: Option<oneshot::Sender<Event>>,
+    _guard: Option<EventTicketGuard>,
+}
+
+impl EventTicket {
+    fn publish(mut self, event: Event) -> bool {
+        self.event_tx
+            .take()
+            .is_some_and(|event_tx| event_tx.send(event).is_ok())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventAdmissionState {
+    Open,
+    Draining,
+    Overflowed,
+    Sealed,
+    Terminal,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventReservationError {
+    Overflowed,
+    Closed,
+}
+
 /// 正在等待 response 的 SUBMIT，用于 sliding-window 计数和重传跟踪。
 struct PendingSubmit {
     packet: Bytes,
     retry_count: u32,
     last_send_time: Instant,
+    _window_permit: OwnedSemaphorePermit,
+}
+
+struct Outbound {
+    packet: Bytes,
+    written_tx: Option<oneshot::Sender<()>>,
+    written_flag: Option<Arc<AtomicBool>>,
+    cancel_after_peer_terminate: bool,
+    marks_peer_terminate_response: bool,
+    open_only: bool,
+    submit_drain_marker: bool,
+    event_after_write: Option<(EventTicket, Event)>,
+}
+
+impl Outbound {
+    fn plain(packet: Bytes) -> Self {
+        Outbound {
+            packet,
+            written_tx: None,
+            written_flag: None,
+            cancel_after_peer_terminate: false,
+            marks_peer_terminate_response: false,
+            open_only: false,
+            submit_drain_marker: false,
+            event_after_write: None,
+        }
+    }
+
+    fn tracked(packet: Bytes) -> (Self, oneshot::Receiver<()>) {
+        let (written_tx, written_rx) = oneshot::channel();
+        (
+            Outbound {
+                packet,
+                written_tx: Some(written_tx),
+                written_flag: None,
+                cancel_after_peer_terminate: false,
+                marks_peer_terminate_response: false,
+                open_only: false,
+                submit_drain_marker: false,
+                event_after_write: None,
+            },
+            written_rx,
+        )
+    }
+
+    fn local_terminate(
+        packet: Bytes,
+        written_flag: Arc<AtomicBool>,
+    ) -> (Self, oneshot::Receiver<()>) {
+        let (mut outbound, written_rx) = Self::tracked(packet);
+        outbound.written_flag = Some(written_flag);
+        outbound.cancel_after_peer_terminate = true;
+        (outbound, written_rx)
+    }
+
+    fn peer_terminate_response(packet: Bytes) -> (Self, oneshot::Receiver<()>) {
+        let (mut outbound, written_rx) = Self::tracked(packet);
+        outbound.marks_peer_terminate_response = true;
+        (outbound, written_rx)
+    }
+
+    fn tracked_event(
+        packet: Bytes,
+        ticket: EventTicket,
+        event: Event,
+    ) -> (Self, oneshot::Receiver<()>) {
+        let (mut outbound, written_rx) = Self::tracked(packet);
+        outbound.event_after_write = Some((ticket, event));
+        (outbound, written_rx)
+    }
+
+    fn open_only(packet: Bytes) -> Self {
+        let mut outbound = Self::plain(packet);
+        outbound.open_only = true;
+        outbound
+    }
+
+    fn submit_drain_marker() -> (Self, oneshot::Receiver<()>) {
+        let (mut outbound, written_rx) = Self::tracked(Bytes::new());
+        outbound.submit_drain_marker = true;
+        (outbound, written_rx)
+    }
+}
+
+struct PendingTerminate {
+    sequence_id: u32,
+    response_tx: oneshot::Sender<()>,
+    written: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ConnectionPhase {
+    Open = 0,
+    Closing = 1,
+    Closed = 2,
 }
 
 /// `Arc` 后面的共享 connection state。
 struct Inner {
     seq_generator: AtomicU32,
-    tx: mpsc::Sender<Bytes>,
-    events_tx: mpsc::Sender<Event>,
+    submit_tx: mpsc::Sender<Outbound>,
+    control_tx: mpsc::Sender<Outbound>,
+    event_spool_tx: mpsc::Sender<EventSpoolItem>,
+    event_admission: StdMutex<EventAdmissionState>,
+    event_depth: Arc<AtomicUsize>,
+    event_tickets: Arc<EventTicketTracker>,
+    event_overflowed: AtomicBool,
+    terminal_reason: StdMutex<Option<Error>>,
     pending_submits: RwLock<HashMap<u32, PendingSubmit>>,
-    window_semaphore: Semaphore,
+    window_semaphore: Arc<Semaphore>,
+    submit_admission: StdMutex<()>,
     heartbeat_pending: RwLock<HashMap<u32, (Instant, u32)>>,
-    is_closed: AtomicBool,
-    writer_shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
-    reader_shutdown: Notify,
-    background_tasks: Mutex<Vec<JoinHandle<()>>>,
+    phase: AtomicU8,
+    phase_tx: watch::Sender<ConnectionPhase>,
+    external_handles: AtomicUsize,
+    close_driver_started: AtomicBool,
+    takeover_started: AtomicBool,
+    drain_submits_on_close: AtomicBool,
+    close_complete_tx: watch::Sender<bool>,
+    cleanup_complete_tx: watch::Sender<bool>,
+    workers_remaining: AtomicUsize,
+    workers_complete_tx: watch::Sender<bool>,
+    pending_terminate: Mutex<Option<PendingTerminate>>,
+    peer_terminate_seen: AtomicBool,
+    peer_terminate_response_written: AtomicBool,
+    runtime_handle: tokio::runtime::Handle,
     response_timeout: Duration,
     retry_count: u32,
 }
@@ -118,23 +315,310 @@ impl Inner {
         }
     }
 
-    /// 丢弃所有 pending SUBMIT（释放 window permits）并标记为 closed。
+    fn phase(&self) -> ConnectionPhase {
+        match self.phase.load(Ordering::SeqCst) {
+            0 => ConnectionPhase::Open,
+            1 => ConnectionPhase::Closing,
+            _ => ConnectionPhase::Closed,
+        }
+    }
+
+    fn begin_closing(&self, drain_submits: bool) -> bool {
+        let _admission = self
+            .submit_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let phase = self.phase();
+        if phase != ConnectionPhase::Open {
+            if phase == ConnectionPhase::Closing && !drain_submits {
+                self.drain_submits_on_close.store(false, Ordering::SeqCst);
+            }
+            return false;
+        }
+        self.drain_submits_on_close
+            .store(drain_submits, Ordering::SeqCst);
+        self.phase
+            .store(ConnectionPhase::Closing as u8, Ordering::SeqCst);
+        self.phase_tx.send_if_modified(|phase| {
+            if *phase == ConnectionPhase::Open {
+                *phase = ConnectionPhase::Closing;
+                true
+            } else {
+                false
+            }
+        });
+        true
+    }
+
+    fn transition_to_closed(&self) -> bool {
+        let _admission = self
+            .submit_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .phase
+            .swap(ConnectionPhase::Closed as u8, Ordering::SeqCst)
+            == ConnectionPhase::Closed as u8
+        {
+            return false;
+        }
+        self.phase_tx.send_replace(ConnectionPhase::Closed);
+        true
+    }
+
+    /// 丢弃所有 pending SUBMIT；其 owned permit 会随 entry 一同释放。
     async fn fail_all_pending(&self) {
-        self.is_closed.store(true, Ordering::SeqCst);
-        let mut map = self.pending_submits.write().await;
-        let n = map.len();
-        map.clear();
-        if n > 0 {
-            self.window_semaphore.add_permits(n);
+        self.pending_submits.write().await.clear();
+    }
+
+    fn make_event_ticket(&self, track_until_publish: bool) -> std::result::Result<EventTicket, ()> {
+        let (event_tx, event_rx) = oneshot::channel();
+        let guard = track_until_publish.then(|| EventTicketGuard::new(self.event_tickets.clone()));
+        let item = EventSpoolItem::Event {
+            event_rx,
+            _depth_permit: EventDepthPermit::new(self.event_depth.clone()),
+        };
+        if self.event_spool_tx.try_send(item).is_err() {
+            return Err(());
+        }
+        Ok(EventTicket {
+            event_tx: Some(event_tx),
+            _guard: guard,
+        })
+    }
+
+    fn reserve_event(
+        self: &Arc<Self>,
+        preserve_on_overflow: bool,
+        track_until_publish: bool,
+    ) -> std::result::Result<EventTicket, EventReservationError> {
+        let mut start_overload_close = false;
+        let reservation = {
+            let mut admission = self
+                .event_admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match *admission {
+                EventAdmissionState::Terminal | EventAdmissionState::Sealed => {
+                    Err(EventReservationError::Closed)
+                }
+                EventAdmissionState::Overflowed => Err(EventReservationError::Overflowed),
+                EventAdmissionState::Open | EventAdmissionState::Draining => {
+                    if self.event_depth.load(Ordering::SeqCst) < EVENT_SPOOL_NORMAL_CAPACITY {
+                        match self.make_event_ticket(track_until_publish) {
+                            Ok(ticket) => Ok(ticket),
+                            Err(()) => {
+                                *admission = EventAdmissionState::Overflowed;
+                                self.event_overflowed.store(true, Ordering::Release);
+                                start_overload_close = true;
+                                Err(EventReservationError::Overflowed)
+                            }
+                        }
+                    } else {
+                        *admission = EventAdmissionState::Overflowed;
+                        self.event_overflowed.store(true, Ordering::Release);
+                        start_overload_close = true;
+                        if preserve_on_overflow {
+                            self.make_event_ticket(track_until_publish)
+                                .map_err(|()| EventReservationError::Overflowed)
+                        } else {
+                            Err(EventReservationError::Overflowed)
+                        }
+                    }
+                }
+            }
+        };
+
+        if start_overload_close {
+            self.start_event_overload_close();
+        }
+        reservation
+    }
+
+    fn emit_event(self: &Arc<Self>, event: Event) -> bool {
+        match self.reserve_event(true, false) {
+            Ok(ticket) => ticket.publish(event),
+            Err(_) => false,
+        }
+    }
+
+    fn begin_event_drain(&self) {
+        let mut admission = self
+            .event_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *admission == EventAdmissionState::Open {
+            *admission = EventAdmissionState::Draining;
+        }
+    }
+
+    fn seal_event_admission_if_idle(&self) -> bool {
+        let mut admission = self
+            .event_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(
+            *admission,
+            EventAdmissionState::Sealed | EventAdmissionState::Terminal
+        ) {
+            return true;
+        }
+        if *self.event_tickets.pending_tx.borrow() != 0 {
+            return false;
+        }
+        *admission = EventAdmissionState::Sealed;
+        true
+    }
+
+    fn seal_event_admission(&self) {
+        let mut admission = self
+            .event_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *admission != EventAdmissionState::Terminal {
+            *admission = EventAdmissionState::Sealed;
+        }
+    }
+
+    fn start_event_overload_close(self: &Arc<Self>) {
+        log::error!(
+            "CMPP event backlog 已达到上限 {}，正在有界关闭 connection",
+            EVENT_SPOOL_NORMAL_CAPACITY
+        );
+        if !self.begin_closing(false) {
+            return;
+        }
+
+        let inner = self.clone();
+        let close_task = async move {
+            drain_event_tickets(&inner, "event backlog 关闭").await;
+            inner.finish(Some(Error::ChannelClosed));
+        };
+        if let Ok(runtime_handle) = tokio::runtime::Handle::try_current() {
+            runtime_handle.spawn(close_task);
+        } else {
+            self.runtime_handle.spawn(close_task);
+        }
+    }
+
+    fn close_event_spool(&self) {
+        let mut admission = self
+            .event_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *admission == EventAdmissionState::Terminal {
+            return;
+        }
+        *admission = EventAdmissionState::Terminal;
+        let reason = self
+            .terminal_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let item = EventSpoolItem::Terminal {
+            reason,
+            _depth_permit: EventDepthPermit::new(self.event_depth.clone()),
+        };
+        if self.event_spool_tx.try_send(item).is_err() {
+            log::error!("CMPP event dispatcher 已退出，无法发布 connection 终态");
+        }
+    }
+
+    /// 统一完成 connection 终止；清理在 detached task 中继续，避免调用方取消留下半终态。
+    fn finish(self: &Arc<Self>, reason: Option<Error>) {
+        let reason = if self.peer_terminate_seen.load(Ordering::SeqCst) {
+            Some(Error::Terminated)
+        } else if self.event_overflowed.load(Ordering::Acquire) {
+            Some(Error::ChannelClosed)
+        } else {
+            reason
+        };
+        let mut terminal_reason = self
+            .terminal_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.phase() == ConnectionPhase::Closed {
+            return;
+        }
+        *terminal_reason = reason;
+        if !self.transition_to_closed() {
+            return;
+        }
+        drop(terminal_reason);
+        self.drain_submits_on_close.store(false, Ordering::SeqCst);
+        self.window_semaphore.close();
+        let inner = self.clone();
+        let cleanup = async move {
+            inner.fail_all_pending().await;
+            inner.pending_terminate.lock().await.take();
+            inner.close_event_spool();
+            inner.cleanup_complete_tx.send_replace(true);
+        };
+        if let Ok(runtime_handle) = tokio::runtime::Handle::try_current() {
+            runtime_handle.spawn(cleanup);
+        } else {
+            self.runtime_handle.spawn(cleanup);
         }
     }
 }
 
+struct WorkerGuard {
+    inner: Arc<Inner>,
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        if self.inner.workers_remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.inner.workers_complete_tx.send_replace(true);
+        }
+    }
+}
+
+struct TakeoverGuard {
+    inner: Arc<Inner>,
+}
+
+impl Drop for TakeoverGuard {
+    fn drop(&mut self) {
+        self.inner.takeover_started.store(false, Ordering::SeqCst);
+    }
+}
+
+fn spawn_worker<F>(inner: Arc<Inner>, future: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let guard = WorkerGuard { inner };
+    tokio::spawn(async move {
+        let _guard = guard;
+        future.await;
+    })
+}
+
 /// Async CMPP 2.0 client connection。clone 成本低（通过 `Arc` 共享 state）。
-#[derive(Clone)]
 pub struct CmppConnection {
     inner: Arc<Inner>,
     events_rx: Arc<Mutex<Option<mpsc::Receiver<Event>>>>,
+    background_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl Clone for CmppConnection {
+    fn clone(&self) -> Self {
+        self.inner.external_handles.fetch_add(1, Ordering::SeqCst);
+        CmppConnection {
+            inner: self.inner.clone(),
+            events_rx: self.events_rx.clone(),
+            background_tasks: self.background_tasks.clone(),
+        }
+    }
+}
+
+impl Drop for CmppConnection {
+    fn drop(&mut self) {
+        if self.inner.external_handles.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.inner.finish(None);
+        }
+    }
 }
 
 impl CmppConnection {
@@ -176,9 +660,12 @@ impl CmppConnection {
             hex_bytes(config.password.as_bytes())
         );
 
-        write_half
-            .write_all(&Pdu::Connect(connect).encode(connect_seq))
-            .await?;
+        tokio::time::timeout(
+            Duration::from_secs(params.connect_timeout),
+            write_half.write_all(&Pdu::Connect(connect).encode(connect_seq)),
+        )
+        .await
+        .map_err(|_| Error::Connect("CMPP CONNECT write 超时".into()))??;
 
         let resp = tokio::time::timeout(Duration::from_secs(params.connect_timeout), framed.next())
             .await
@@ -242,44 +729,94 @@ impl CmppConnection {
 
         // --- 装配运行中的 connection ---
         let window_size = params.window_size;
-        let (tx, rx) = mpsc::channel::<Bytes>(SEND_CHANNEL_CAPACITY);
+        let (submit_tx, submit_rx) = mpsc::channel::<Outbound>(SEND_CHANNEL_CAPACITY);
+        let (control_tx, control_rx) = mpsc::channel::<Outbound>(CONTROL_CHANNEL_CAPACITY);
+        let (event_spool_tx, event_spool_rx) = mpsc::channel::<EventSpoolItem>(
+            EVENT_SPOOL_NORMAL_CAPACITY + EVENT_SPOOL_EMERGENCY_CAPACITY,
+        );
         let (events_tx, events_rx) = mpsc::channel::<Event>(INCOMING_CHANNEL_CAPACITY);
-        let (writer_shutdown_tx, writer_shutdown_rx) = oneshot::channel();
+        let (phase_tx, _) = watch::channel(ConnectionPhase::Open);
+        let (close_complete_tx, _) = watch::channel(false);
+        let (cleanup_complete_tx, _) = watch::channel(false);
+        let (workers_complete_tx, _) = watch::channel(false);
+        let (event_tickets_pending_tx, _) = watch::channel(0usize);
+        let event_depth = Arc::new(AtomicUsize::new(0));
+        let event_tickets = Arc::new(EventTicketTracker {
+            pending_tx: event_tickets_pending_tx,
+        });
 
         let inner = Arc::new(Inner {
             seq_generator: AtomicU32::new(2), // seq 1 已由 CONNECT 使用
-            tx,
-            events_tx,
+            submit_tx,
+            control_tx,
+            event_spool_tx,
+            event_admission: StdMutex::new(EventAdmissionState::Open),
+            event_depth,
+            event_tickets,
+            event_overflowed: AtomicBool::new(false),
+            terminal_reason: StdMutex::new(None),
             pending_submits: RwLock::new(HashMap::new()),
-            window_semaphore: Semaphore::new(window_size),
+            window_semaphore: Arc::new(Semaphore::new(window_size)),
+            submit_admission: StdMutex::new(()),
             heartbeat_pending: RwLock::new(HashMap::new()),
-            is_closed: AtomicBool::new(false),
-            writer_shutdown_tx: Mutex::new(Some(writer_shutdown_tx)),
-            reader_shutdown: Notify::new(),
-            background_tasks: Mutex::new(Vec::new()),
+            phase: AtomicU8::new(ConnectionPhase::Open as u8),
+            phase_tx,
+            external_handles: AtomicUsize::new(1),
+            close_driver_started: AtomicBool::new(false),
+            takeover_started: AtomicBool::new(false),
+            drain_submits_on_close: AtomicBool::new(false),
+            close_complete_tx,
+            cleanup_complete_tx,
+            workers_remaining: AtomicUsize::new(4),
+            workers_complete_tx,
+            pending_terminate: Mutex::new(None),
+            peer_terminate_seen: AtomicBool::new(false),
+            peer_terminate_response_written: AtomicBool::new(false),
+            runtime_handle: tokio::runtime::Handle::current(),
             response_timeout: Duration::from_secs(params.response_timeout),
             retry_count: params.retry_count,
         });
 
-        let writer = tokio::spawn(writer_task(write_half, rx, writer_shutdown_rx));
-        let reader = tokio::spawn(reader_task(
+        let dispatcher_handle = tokio::spawn(event_dispatcher_task(event_spool_rx, events_tx));
+        drop(dispatcher_handle);
+
+        let writer = spawn_worker(
             inner.clone(),
-            framed,
-            Duration::from_secs(params.read_idle_timeout),
-        ));
-        let heartbeat = tokio::spawn(heartbeat_task(
+            writer_task(
+                inner.clone(),
+                write_half,
+                submit_rx,
+                control_rx,
+                inner.phase_tx.subscribe(),
+            ),
+        );
+        let reader = spawn_worker(
             inner.clone(),
-            Duration::from_secs(params.heartbeat_interval),
-        ));
-        let timeout = tokio::spawn(timeout_task(inner.clone()));
-        {
-            let mut tasks = inner.background_tasks.lock().await;
-            tasks.extend([writer, reader, heartbeat, timeout]);
-        }
+            reader_task(
+                inner.clone(),
+                framed,
+                Duration::from_secs(params.read_idle_timeout),
+                inner.phase_tx.subscribe(),
+            ),
+        );
+        let heartbeat = spawn_worker(
+            inner.clone(),
+            heartbeat_task(
+                inner.clone(),
+                Duration::from_secs(params.heartbeat_interval),
+                inner.phase_tx.subscribe(),
+            ),
+        );
+        let timeout = spawn_worker(
+            inner.clone(),
+            timeout_task(inner.clone(), inner.phase_tx.subscribe()),
+        );
+        let background_tasks = Arc::new(Mutex::new(vec![writer, reader, heartbeat, timeout]));
 
         Ok(CmppConnection {
             inner,
             events_rx: Arc::new(Mutex::new(Some(events_rx))),
+            background_tasks,
         })
     }
 
@@ -290,7 +827,7 @@ impl CmppConnection {
 
     /// connection 是否已关闭。
     pub fn is_closed(&self) -> bool {
-        self.inner.is_closed.load(Ordering::SeqCst)
+        self.inner.phase() != ConnectionPhase::Open
     }
 
     /// Submit message，并为每个 SMS segment 返回一个 sequence id。
@@ -330,74 +867,259 @@ impl CmppConnection {
     }
 
     async fn send_submit(&self, sequence_id: u32, submit: Submit) -> Result<()> {
-        let permit = self
-            .inner
-            .window_semaphore
-            .acquire()
-            .await
-            .map_err(|_| Error::Closed)?;
-        permit.forget();
+        let mut phase_rx = self.inner.phase_tx.subscribe();
+        let permit = tokio::select! {
+            biased;
+            _ = wait_until_not_open(&mut phase_rx) => return Err(Error::Closed),
+            result = self.inner.window_semaphore.clone().acquire_owned() => {
+                result.map_err(|_| Error::Closed)?
+            }
+        };
 
         let bytes = Pdu::Submit(Box::new(submit)).encode(sequence_id);
-        {
-            let mut pending = self.inner.pending_submits.write().await;
-            pending.insert(
-                sequence_id,
-                PendingSubmit {
-                    packet: bytes.clone(),
-                    retry_count: 0,
-                    last_send_time: Instant::now(),
-                },
-            );
-        }
+        let submit_tx = self.inner.submit_tx.clone();
+        let queue_permit = tokio::select! {
+            biased;
+            _ = wait_until_not_open(&mut phase_rx) => return Err(Error::Closed),
+            result = submit_tx.reserve_owned() => {
+                match result {
+                    Ok(permit) => permit,
+                    Err(_) if self.inner.phase() == ConnectionPhase::Open => {
+                        return Err(Error::ChannelClosed);
+                    }
+                    Err(_) => return Err(Error::Closed),
+                }
+            }
+        };
 
-        if self.inner.tx.send(bytes).await.is_err() {
-            self.inner
-                .pending_submits
-                .write()
-                .await
-                .remove(&sequence_id);
-            self.inner.window_semaphore.add_permits(1);
-            return Err(Error::ChannelClosed);
+        let mut pending = self.inner.pending_submits.write().await;
+        let _admission = self
+            .inner
+            .submit_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.inner.phase() != ConnectionPhase::Open {
+            return Err(Error::Closed);
         }
+        pending.insert(
+            sequence_id,
+            PendingSubmit {
+                packet: bytes.clone(),
+                retry_count: 0,
+                last_send_time: Instant::now(),
+                _window_permit: permit,
+            },
+        );
+        queue_permit.send(Outbound::plain(bytes));
         Ok(())
     }
 
     /// 优雅关闭 connection：发送 CMPP_TERMINATE，然后拆除。
     pub async fn close(&self) {
-        if self.inner.is_closed.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        log::info!("正在关闭 CMPP connection");
-
-        // 尽力执行优雅 TERMINATE。
-        let term_seq = self.inner.next_seq_id();
         if self
             .inner
-            .tx
-            .send(Pdu::Terminate.encode(term_seq))
-            .await
+            .close_driver_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let inner = self.inner.clone();
+            let background_tasks = self.background_tasks.clone();
+            if self.inner.begin_closing(true) {
+                self.inner.begin_event_drain();
+                tokio::spawn(async move {
+                    graceful_close_task(inner, background_tasks).await;
+                });
+            } else {
+                tokio::spawn(async move {
+                    reap_background_tasks(inner, background_tasks).await;
+                });
+            }
         }
-
-        // 通知 writer 和 reader 停止。
-        if let Some(tx) = self.inner.writer_shutdown_tx.lock().await.take() {
-            let _ = tx.send(());
-        }
-        self.inner.reader_shutdown.notify_one();
-
-        // 释放所有 pending submitter。
-        self.inner.fail_all_pending().await;
-
-        // 停止 background tasks。
-        let handles: Vec<JoinHandle<()>> =
-            std::mem::take(&mut *self.inner.background_tasks.lock().await);
-        for h in handles {
-            h.abort();
+        let mut complete_rx = self.inner.close_complete_tx.subscribe();
+        let takeover_after = self
+            .inner
+            .response_timeout
+            .saturating_mul(3)
+            .saturating_add(Duration::from_secs(1));
+        if tokio::time::timeout(takeover_after, wait_until_true(&mut complete_rx))
+            .await
+            .is_err()
+        {
+            log::warn!("CMPP close driver 未按时完成，正在当前 runtime 接管清理");
+            loop {
+                if *self.inner.close_complete_tx.borrow() {
+                    break;
+                }
+                if self
+                    .inner
+                    .takeover_started
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    let inner = self.inner.clone();
+                    let background_tasks = self.background_tasks.clone();
+                    let takeover_guard = TakeoverGuard {
+                        inner: inner.clone(),
+                    };
+                    tokio::spawn(async move {
+                        let _guard = takeover_guard;
+                        let reason = if inner.peer_terminate_seen.load(Ordering::SeqCst) {
+                            Some(Error::Terminated)
+                        } else {
+                            None
+                        };
+                        drain_event_tickets(&inner, "接管关闭").await;
+                        inner.finish(reason);
+                        reap_background_tasks(inner, background_tasks).await;
+                    });
+                }
+                let mut takeover_rx = self.inner.close_complete_tx.subscribe();
+                let takeover_timeout = self.inner.response_timeout.saturating_mul(5);
+                if tokio::time::timeout(takeover_timeout, wait_until_true(&mut takeover_rx))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                log::error!("CMPP connection 接管清理未按时完成，正在重试接管");
+            }
         }
     }
+}
+
+async fn graceful_close_task(inner: Arc<Inner>, background_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>) {
+    log::info!("正在关闭 CMPP connection");
+    let mut phase_rx = inner.phase_tx.subscribe();
+
+    let (drain_marker, drain_written_rx) = Outbound::submit_drain_marker();
+    let drain_result = tokio::time::timeout(inner.response_timeout, async {
+        send_outbound_until_closed(&inner.submit_tx, drain_marker, &mut phase_rx)
+            .await
+            .map_err(|_| ())?;
+        drain_written_rx.await.map_err(|_| ())
+    })
+    .await;
+    inner.drain_submits_on_close.store(false, Ordering::SeqCst);
+    if drain_result.is_err() {
+        log::warn!("优雅关闭等待已接受 SUBMIT 排空超时");
+    } else if matches!(drain_result, Ok(Err(()))) {
+        log::debug!("优雅关闭的 SUBMIT 排空在 connection 关闭前未完成");
+    }
+
+    let term_seq = inner.next_seq_id();
+    let (response_tx, response_rx) = oneshot::channel();
+    let written = Arc::new(AtomicBool::new(false));
+    *inner.pending_terminate.lock().await = Some(PendingTerminate {
+        sequence_id: term_seq,
+        response_tx,
+        written: written.clone(),
+    });
+    let (outbound, written_rx) =
+        Outbound::local_terminate(Pdu::Terminate.encode(term_seq), written);
+
+    let close_result = tokio::time::timeout(inner.response_timeout, async {
+        send_outbound_until_closed(&inner.control_tx, outbound, &mut phase_rx)
+            .await
+            .map_err(|_| ())?;
+        written_rx.await.map_err(|_| ())?;
+        tokio::select! {
+            biased;
+            _ = wait_until_closed(&mut phase_rx) => Err(()),
+            result = response_rx => result.map_err(|_| ()),
+        }
+    })
+    .await;
+
+    if close_result.is_err() {
+        log::warn!("CMPP TERMINATE handshake 超时");
+    } else if matches!(close_result, Ok(Err(()))) {
+        log::debug!("CMPP TERMINATE handshake 在 connection 关闭前未完成");
+    }
+
+    drain_event_tickets(&inner, "优雅关闭").await;
+
+    let reason = if inner.peer_terminate_seen.load(Ordering::SeqCst) {
+        Some(Error::Terminated)
+    } else {
+        None
+    };
+    inner.finish(reason);
+    {
+        let mut pending = inner.pending_terminate.lock().await;
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.sequence_id == term_seq)
+        {
+            pending.take();
+        }
+    }
+    reap_background_tasks(inner, background_tasks).await;
+}
+
+async fn reap_background_tasks(
+    inner: Arc<Inner>,
+    background_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+) {
+    let mut phase_rx = inner.phase_tx.subscribe();
+    if tokio::time::timeout(inner.response_timeout, wait_until_closed(&mut phase_rx))
+        .await
+        .is_err()
+    {
+        log::warn!("等待 CMPP connection 进入 Closed 超时，执行强制收口");
+        let reason = if inner.peer_terminate_seen.load(Ordering::SeqCst) {
+            Some(Error::Terminated)
+        } else {
+            None
+        };
+        inner.finish(reason);
+    }
+
+    {
+        let handles = background_tasks.lock().await;
+        for handle in handles.iter() {
+            handle.abort();
+        }
+    }
+    let mut workers_rx = inner.workers_complete_tx.subscribe();
+    let workers_completed =
+        tokio::time::timeout(inner.response_timeout, wait_until_true(&mut workers_rx))
+            .await
+            .is_ok();
+    if !workers_completed {
+        log::warn!("等待 CMPP background tasks 退出超时");
+    }
+
+    if workers_completed {
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *background_tasks.lock().await);
+        if tokio::time::timeout(inner.response_timeout, async {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            log::warn!("回收 CMPP background task handles 超时");
+        }
+    }
+    let mut cleanup_rx = inner.cleanup_complete_tx.subscribe();
+    if tokio::time::timeout(inner.response_timeout, wait_until_true(&mut cleanup_rx))
+        .await
+        .is_err()
+    {
+        log::warn!("等待 CMPP connection cleanup 完成超时，执行幂等兜底清理");
+        let fallback_result = tokio::time::timeout(inner.response_timeout, async {
+            inner.fail_all_pending().await;
+            inner.pending_terminate.lock().await.take();
+            inner.close_event_spool();
+            inner.cleanup_complete_tx.send_replace(true);
+        })
+        .await;
+        if fallback_result.is_err() {
+            log::error!("CMPP connection 兜底清理未按时完成");
+        }
+    }
+    inner.close_complete_tx.send_replace(true);
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -437,25 +1159,282 @@ fn configure_keepalive(stream: &TcpStream, idle: Duration) {
 }
 
 /// 将 send channel 中的数据写入 socket；shutdown 或 write error 时停止。
-async fn writer_task(
-    mut writer: OwnedWriteHalf,
-    mut rx: mpsc::Receiver<Bytes>,
-    mut shutdown: oneshot::Receiver<()>,
-) {
+async fn wait_until_closed(phase_rx: &mut watch::Receiver<ConnectionPhase>) {
     loop {
-        tokio::select! {
-            _ = &mut shutdown => {
+        if *phase_rx.borrow() == ConnectionPhase::Closed {
+            return;
+        }
+        if phase_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn wait_until_not_open(phase_rx: &mut watch::Receiver<ConnectionPhase>) {
+    loop {
+        if *phase_rx.borrow() != ConnectionPhase::Open {
+            return;
+        }
+        if phase_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn wait_until_true(complete_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *complete_rx.borrow() {
+            return;
+        }
+        if complete_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn wait_until_zero(pending_rx: &mut watch::Receiver<usize>) {
+    loop {
+        if *pending_rx.borrow() == 0 {
+            return;
+        }
+        if pending_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn drain_event_tickets(inner: &Arc<Inner>, context: &str) {
+    inner.begin_event_drain();
+    let mut pending_rx = inner.event_tickets.pending_tx.subscribe();
+    let drain_result = tokio::time::timeout(inner.response_timeout, async {
+        loop {
+            if inner.seal_event_admission_if_idle() {
+                return;
+            }
+            wait_until_zero(&mut pending_rx).await;
+        }
+    })
+    .await;
+    if drain_result.is_err() {
+        log::warn!("{}等待已接受 event 完成超时", context);
+        inner.seal_event_admission();
+    }
+}
+
+async fn send_outbound_until_closed(
+    tx: &mpsc::Sender<Outbound>,
+    outbound: Outbound,
+    phase_rx: &mut watch::Receiver<ConnectionPhase>,
+) -> std::result::Result<(), ()> {
+    tokio::select! {
+        biased;
+        _ = wait_until_closed(phase_rx) => Err(()),
+        result = tx.send(outbound) => result.map_err(|_| ()),
+    }
+}
+
+async fn send_until_closed(
+    tx: &mpsc::Sender<Outbound>,
+    bytes: Bytes,
+    phase_rx: &mut watch::Receiver<ConnectionPhase>,
+) -> std::result::Result<(), ()> {
+    send_outbound_until_closed(tx, Outbound::plain(bytes), phase_rx).await
+}
+
+async fn send_while_open(
+    tx: &mpsc::Sender<Outbound>,
+    bytes: Bytes,
+    phase_rx: &mut watch::Receiver<ConnectionPhase>,
+) -> std::result::Result<(), ()> {
+    tokio::select! {
+        biased;
+        _ = wait_until_not_open(phase_rx) => Err(()),
+        result = tx.send(Outbound::plain(bytes)) => result.map_err(|_| ()),
+    }
+}
+
+async fn send_open_only_control(
+    tx: &mpsc::Sender<Outbound>,
+    bytes: Bytes,
+    phase_rx: &mut watch::Receiver<ConnectionPhase>,
+) -> std::result::Result<(), ()> {
+    tokio::select! {
+        biased;
+        _ = wait_until_not_open(phase_rx) => Err(()),
+        result = tx.send(Outbound::open_only(bytes)) => result.map_err(|_| ()),
+    }
+}
+
+async fn event_dispatcher_task(
+    mut event_spool_rx: mpsc::Receiver<EventSpoolItem>,
+    events_tx: mpsc::Sender<Event>,
+) {
+    let mut discard_events = false;
+
+    while let Some(item) = event_spool_rx.recv().await {
+        match item {
+            EventSpoolItem::Event {
+                event_rx,
+                _depth_permit,
+            } => {
+                if discard_events {
+                    continue;
+                }
+                let event = match event_rx.await {
+                    Ok(event) => event,
+                    Err(_) => continue,
+                };
+                if !discard_events && events_tx.send(event).await.is_err() {
+                    discard_events = true;
+                    log::debug!("event receiver 已丢弃；后续 event 将被有界排空");
+                }
+            }
+            EventSpoolItem::Terminal {
+                reason,
+                _depth_permit,
+            } => {
+                if let Some(reason) = reason
+                    && !discard_events
+                {
+                    let _ = events_tx.send(Event::Disconnected(reason)).await;
+                }
+                break;
+            }
+        }
+    }
+    log::debug!("event dispatcher task 已退出");
+}
+
+async fn writer_task(
+    inner: Arc<Inner>,
+    mut writer: OwnedWriteHalf,
+    mut submit_rx: mpsc::Receiver<Outbound>,
+    mut control_rx: mpsc::Receiver<Outbound>,
+    mut phase_rx: watch::Receiver<ConnectionPhase>,
+) {
+    let mut control_burst = 0usize;
+    loop {
+        let phase = inner.phase();
+        if phase == ConnectionPhase::Closed {
+            let _ = writer.shutdown().await;
+            break;
+        }
+        let can_send_submit = phase == ConnectionPhase::Open
+            || (phase == ConnectionPhase::Closing
+                && inner.drain_submits_on_close.load(Ordering::SeqCst));
+        let next = if can_send_submit {
+            if control_burst >= CONTROL_BURST_LIMIT {
+                tokio::select! {
+                    biased;
+                    changed = phase_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    outbound = submit_rx.recv() => outbound.map(|outbound| (outbound, true)),
+                    outbound = control_rx.recv() => outbound.map(|outbound| (outbound, false)),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    changed = phase_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    outbound = control_rx.recv() => outbound.map(|outbound| (outbound, false)),
+                    outbound = submit_rx.recv() => outbound.map(|outbound| (outbound, true)),
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                changed = phase_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                outbound = control_rx.recv() => outbound.map(|outbound| (outbound, false)),
+            }
+        };
+
+        let Some((mut outbound, is_submit)) = next else {
+            inner.finish(Some(Error::ChannelClosed));
+            break;
+        };
+        if is_submit {
+            control_burst = 0;
+        } else {
+            control_burst = control_burst.saturating_add(1);
+        }
+        if outbound.submit_drain_marker {
+            inner.drain_submits_on_close.store(false, Ordering::SeqCst);
+            if let Some(written_tx) = outbound.written_tx.take() {
+                let _ = written_tx.send(());
+            }
+            continue;
+        }
+        let phase = inner.phase();
+        if is_submit
+            && phase != ConnectionPhase::Open
+            && !inner.drain_submits_on_close.load(Ordering::SeqCst)
+        {
+            continue;
+        }
+        if outbound.open_only && phase != ConnectionPhase::Open {
+            continue;
+        }
+        if outbound.cancel_after_peer_terminate
+            && inner
+                .peer_terminate_response_written
+                .load(Ordering::Acquire)
+        {
+            log::debug!("peer TERMINATE 已完成响应，取消尚未写出的本地 TERMINATE");
+            continue;
+        }
+        let write_result = tokio::select! {
+            biased;
+            _ = wait_until_closed(&mut phase_rx) => {
                 let _ = writer.shutdown().await;
                 break;
             }
-            pkt = rx.recv() => match pkt {
-                Some(bytes) => {
-                    if let Err(e) = writer.write_all(&bytes).await {
-                        log::warn!("CMPP write 错误: {}", e);
-                        break;
-                    }
+            result = tokio::time::timeout(
+                inner.response_timeout,
+                writer.write_all(&outbound.packet),
+            ) => match result {
+                Ok(result) => result,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "CMPP socket write 超时",
+                )),
+            },
+        };
+        match write_result {
+            Ok(()) => {
+                if outbound.marks_peer_terminate_response {
+                    inner
+                        .peer_terminate_response_written
+                        .store(true, Ordering::Release);
                 }
-                None => break,
+                if let Some(written_flag) = outbound.written_flag.take() {
+                    written_flag.store(true, Ordering::Release);
+                }
+                if let Some((ticket, event)) = outbound.event_after_write.take()
+                    && !ticket.publish(event)
+                {
+                    log::error!("协议响应已写出，但 event dispatcher 已不可用");
+                }
+                if let Some(written_tx) = outbound.written_tx.take() {
+                    let _ = written_tx.send(());
+                }
+            }
+            Err(e) => {
+                log::warn!("CMPP write 错误: {}", e);
+                inner.finish(Some(Error::Io(e)));
+                break;
             }
         }
     }
@@ -467,10 +1446,12 @@ async fn reader_task(
     inner: Arc<Inner>,
     mut framed: FramedRead<OwnedReadHalf, CmppFrameCodec>,
     read_idle: Duration,
+    mut phase_rx: watch::Receiver<ConnectionPhase>,
 ) {
     let reason: Error = loop {
         let frame = tokio::select! {
-            _ = inner.reader_shutdown.notified() => break Error::Closed,
+            biased;
+            _ = wait_until_closed(&mut phase_rx) => return,
             res = tokio::time::timeout(read_idle, framed.next()) => match res {
                 Ok(Some(Ok(frame))) => frame,
                 Ok(Some(Err(e))) => { log::warn!("CMPP decode 错误: {}", e); break e; }
@@ -484,26 +1465,34 @@ async fn reader_task(
             Pdu::SubmitResp(resp) => {
                 let pending = {
                     let mut map = inner.pending_submits.write().await;
-                    let removed = map.remove(&sequence_id);
-                    if removed.is_some() {
-                        inner.window_semaphore.add_permits(1);
-                    }
-                    removed
+                    map.remove(&sequence_id)
                 };
                 if pending.is_some() {
-                    let _ = inner
-                        .events_tx
-                        .send(Event::SubmitResp {
+                    if inner.event_overflowed.load(Ordering::Acquire) {
+                        log::debug!(
+                            "event backlog 关闭期间收到 SUBMIT_RESP seq_id={}，仅完成协议状态迁移",
+                            sequence_id
+                        );
+                    } else {
+                        let _ = inner.emit_event(Event::SubmitResp {
                             sequence_id,
                             msg_id: resp.msg_id,
                             result: resp.result,
-                        })
-                        .await;
+                        });
+                    }
                 } else {
                     log::debug!("收到未知 seq_id={} 的 SUBMIT_RESP", sequence_id);
                 }
             }
             Pdu::Deliver(deliver) => {
+                let event_ticket = match inner.reserve_event(true, true) {
+                    Ok(ticket) => ticket,
+                    Err(EventReservationError::Overflowed) => {
+                        log::debug!("event backlog 关闭期间忽略未确认的 DELIVER");
+                        continue;
+                    }
+                    Err(EventReservationError::Closed) => return,
+                };
                 let resp = Frame::new(
                     sequence_id,
                     Pdu::DeliverResp(DeliverResp {
@@ -511,19 +1500,37 @@ async fn reader_task(
                         result: 0,
                     }),
                 );
-                if inner.tx.send(resp.encode()).await.is_err() {
-                    break Error::ChannelClosed;
-                }
-                if inner.events_tx.send(Event::Deliver(deliver)).await.is_err() {
-                    log::debug!("event receiver 已丢弃；忽略 DELIVER");
+                let (outbound, written_rx) =
+                    Outbound::tracked_event(resp.encode(), event_ticket, Event::Deliver(deliver));
+                let response_result = tokio::time::timeout(inner.response_timeout, async {
+                    send_outbound_until_closed(&inner.control_tx, outbound, &mut phase_rx)
+                        .await
+                        .map_err(|_| ())?;
+                    written_rx.await.map_err(|_| ())
+                })
+                .await;
+                match response_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(())) => {
+                        if inner.phase() == ConnectionPhase::Closed {
+                            return;
+                        }
+                        break Error::ChannelClosed;
+                    }
+                    Err(_) => {
+                        log::warn!("CMPP DELIVER_RESP write barrier 超时");
+                        break Error::Timeout;
+                    }
                 }
             }
             Pdu::ActiveTest => {
-                if inner
-                    .tx
-                    .send(Frame::new(sequence_id, Pdu::ActiveTestResp).encode())
-                    .await
-                    .is_err()
+                if send_until_closed(
+                    &inner.control_tx,
+                    Frame::new(sequence_id, Pdu::ActiveTestResp).encode(),
+                    &mut phase_rx,
+                )
+                .await
+                .is_err()
                 {
                     break Error::ChannelClosed;
                 }
@@ -533,14 +1540,50 @@ async fn reader_task(
             }
             Pdu::Terminate => {
                 log::info!("peer 发送 CMPP_TERMINATE，正在拆除");
-                let _ = inner
-                    .tx
-                    .send(Frame::new(sequence_id, Pdu::TerminateResp).encode())
-                    .await;
+                inner.peer_terminate_seen.store(true, Ordering::SeqCst);
+                inner.begin_closing(false);
+                inner.begin_event_drain();
+                let (outbound, written_rx) = Outbound::peer_terminate_response(
+                    Frame::new(sequence_id, Pdu::TerminateResp).encode(),
+                );
+                let response_result = tokio::time::timeout(inner.response_timeout, async {
+                    send_outbound_until_closed(&inner.control_tx, outbound, &mut phase_rx)
+                        .await
+                        .map_err(|_| ())?;
+                    written_rx.await.map_err(|_| ())
+                })
+                .await;
+                if response_result.is_err() {
+                    log::warn!("CMPP TERMINATE_RESP write 超时");
+                }
+                let response_written = matches!(response_result, Ok(Ok(())));
+                let local_terminate_written = inner
+                    .pending_terminate
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|pending| pending.written.load(Ordering::Acquire));
+                if response_written && local_terminate_written {
+                    continue;
+                }
                 break Error::Terminated;
             }
             Pdu::TerminateResp => {
                 log::debug!("收到 TERMINATE_RESP seq_id={}", sequence_id);
+                let response_tx = {
+                    let mut pending = inner.pending_terminate.lock().await;
+                    if pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.sequence_id == sequence_id)
+                    {
+                        pending.take().map(|pending| pending.response_tx)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(response_tx) = response_tx {
+                    let _ = response_tx.send(());
+                }
             }
             other => {
                 log::warn!("收到非预期入站 PDU: {:#010x}", other.command_id());
@@ -548,32 +1591,46 @@ async fn reader_task(
         }
     };
 
-    inner.fail_all_pending().await;
-    let _ = inner.events_tx.send(Event::Disconnected(reason)).await;
+    inner.finish(Some(reason));
     log::debug!("reader task 已退出");
 }
 
 /// 在没有未完成 heartbeat 时周期性发送 ACTIVE_TEST。
-async fn heartbeat_task(inner: Arc<Inner>, interval: Duration) {
+async fn heartbeat_task(
+    inner: Arc<Inner>,
+    interval: Duration,
+    mut phase_rx: watch::Receiver<ConnectionPhase>,
+) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        ticker.tick().await;
-        if inner.is_closed.load(Ordering::SeqCst) {
-            break;
+        tokio::select! {
+            biased;
+            _ = wait_until_not_open(&mut phase_rx) => break,
+            _ = ticker.tick() => {}
         }
         let has_pending = !inner.heartbeat_pending.read().await.is_empty();
         if has_pending {
             continue;
         }
         let seq = inner.next_seq_id();
-        if inner.tx.send(Pdu::ActiveTest.encode(seq)).await.is_ok() {
+        if send_open_only_control(
+            &inner.control_tx,
+            Pdu::ActiveTest.encode(seq),
+            &mut phase_rx,
+        )
+        .await
+        .is_ok()
+        {
             inner
                 .heartbeat_pending
                 .write()
                 .await
                 .insert(seq, (Instant::now(), 0));
         } else {
+            if inner.phase() == ConnectionPhase::Open {
+                inner.finish(Some(Error::ChannelClosed));
+            }
             break;
         }
     }
@@ -581,15 +1638,17 @@ async fn heartbeat_task(inner: Arc<Inner>, interval: Duration) {
 }
 
 /// 重传 timed-out SUBMIT 和 heartbeat；heartbeat 耗尽时拆除连接。
-async fn timeout_task(inner: Arc<Inner>) {
+async fn timeout_task(inner: Arc<Inner>, mut phase_rx: watch::Receiver<ConnectionPhase>) {
     let timeout = inner.response_timeout;
     let retry_count = inner.retry_count;
     let mut ticker = tokio::time::interval(TIMEOUT_CHECK_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        ticker.tick().await;
-        if inner.is_closed.load(Ordering::SeqCst) {
-            break;
+        tokio::select! {
+            biased;
+            _ = wait_until_not_open(&mut phase_rx) => break,
+            _ = ticker.tick() => {}
         }
         let now = Instant::now();
 
@@ -616,26 +1675,35 @@ async fn timeout_task(inner: Arc<Inner>) {
             }
         }
         for seq in hb_retransmit {
-            let _ = inner.tx.send(Pdu::ActiveTest.encode(seq)).await;
+            if send_open_only_control(
+                &inner.control_tx,
+                Pdu::ActiveTest.encode(seq),
+                &mut phase_rx,
+            )
+            .await
+            .is_err()
+            {
+                if inner.phase() == ConnectionPhase::Open {
+                    inner.finish(Some(Error::ChannelClosed));
+                }
+                return;
+            }
         }
         if exhausted {
             log::error!("heartbeat 已耗尽，正在拆除 connection");
-            inner.reader_shutdown.notify_one();
-            if let Some(tx) = inner.writer_shutdown_tx.lock().await.take() {
-                let _ = tx.send(());
-            }
-            break;
+            inner.finish(Some(Error::Closed));
+            return;
         }
 
         // SUBMIT timeout。
         let (has_pending, retransmit, gave_up) = {
             let mut map = inner.pending_submits.write().await;
             let mut retransmit: Vec<(u32, Bytes)> = Vec::new();
-            let mut gave_up: Vec<u32> = Vec::new();
+            let mut gave_up_candidates: Vec<u32> = Vec::new();
             for (seq, p) in map.iter_mut() {
                 if now.duration_since(p.last_send_time) >= timeout {
                     if p.retry_count >= retry_count - 1 {
-                        gave_up.push(*seq);
+                        gave_up_candidates.push(*seq);
                     } else {
                         p.retry_count += 1;
                         p.last_send_time = now;
@@ -643,31 +1711,46 @@ async fn timeout_task(inner: Arc<Inner>) {
                     }
                 }
             }
-            for seq in &gave_up {
-                map.remove(seq);
-                inner.window_semaphore.add_permits(1);
+            let mut gave_up: Vec<(u32, EventTicket)> = Vec::new();
+            for seq in gave_up_candidates {
+                let ticket = match inner.reserve_event(true, false) {
+                    Ok(ticket) => ticket,
+                    Err(_) => break,
+                };
+                if map.remove(&seq).is_some() {
+                    gave_up.push((seq, ticket));
+                }
             }
             let has_pending = !map.is_empty();
             (has_pending, retransmit, gave_up)
         };
+        for (seq, ticket) in gave_up {
+            log::warn!("SUBMIT timeout，放弃重试: seq_id={}", seq);
+            let _ = ticket.publish(Event::SubmitTimeout { sequence_id: seq });
+        }
+        if inner.phase() != ConnectionPhase::Open {
+            return;
+        }
         for (seq, packet) in retransmit {
-            if inner.tx.send(packet).await.is_ok() {
+            if send_while_open(&inner.submit_tx, packet, &mut phase_rx)
+                .await
+                .is_ok()
+            {
                 log::debug!("正在重传 SUBMIT seq_id={}", seq);
+            } else {
+                if inner.phase() == ConnectionPhase::Open {
+                    inner.finish(Some(Error::ChannelClosed));
+                }
+                return;
             }
         }
-        for seq in gave_up {
-            log::warn!("SUBMIT timeout，放弃重试: seq_id={}", seq);
-            let _ = inner
-                .events_tx
-                .send(Event::SubmitTimeout { sequence_id: seq })
-                .await;
-        }
 
-        ticker = if has_pending {
-            tokio::time::interval(TIMEOUT_CHECK_INTERVAL)
+        let next_check = if has_pending {
+            TIMEOUT_CHECK_INTERVAL
         } else {
-            tokio::time::interval(TIMEOUT_CHECK_IDLE_INTERVAL)
+            TIMEOUT_CHECK_IDLE_INTERVAL
         };
+        ticker.reset_after(next_check);
     }
     log::debug!("timeout task 已退出");
 }
