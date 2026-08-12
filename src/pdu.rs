@@ -32,6 +32,10 @@ impl Frame {
     pub fn encode(&self) -> Bytes {
         self.pdu.encode(self.sequence_id)
     }
+
+    pub(crate) fn encode_into(&self, dst: &mut BytesMut) {
+        self.pdu.encode_into(self.sequence_id, dst);
+    }
 }
 
 /// 可 decode / encode 的 CMPP 2.0 protocol data unit。
@@ -78,18 +82,40 @@ impl Pdu {
 
     /// 使用给定 sequence id 序列化当前 PDU（header + body）。
     pub fn encode(&self, sequence_id: u32) -> Bytes {
-        let mut body = BytesMut::new();
+        let mut out = BytesMut::with_capacity(CMPP_HEADER_LENGTH + self.body_len_hint());
+        self.encode_into(sequence_id, &mut out);
+        out.freeze()
+    }
+
+    pub(crate) fn encode_into(&self, sequence_id: u32, dst: &mut BytesMut) {
+        encode_frame_into(
+            dst,
+            self.command_id(),
+            sequence_id,
+            self.body_len_hint(),
+            |body| match self {
+                Pdu::Connect(p) => p.encode_body(body),
+                Pdu::ConnectResp(p) => p.encode_body(body),
+                Pdu::Submit(p) => p.encode_body(body),
+                Pdu::SubmitResp(p) => p.encode_body(body),
+                Pdu::Deliver(p) => p.encode_body(body),
+                Pdu::DeliverResp(p) => p.encode_body(body),
+                Pdu::ActiveTest | Pdu::Terminate | Pdu::TerminateResp => {}
+                Pdu::ActiveTestResp => body.put_u8(0),
+            },
+        );
+    }
+
+    fn body_len_hint(&self) -> usize {
         match self {
-            Pdu::Connect(p) => p.encode_body(&mut body),
-            Pdu::ConnectResp(p) => p.encode_body(&mut body),
-            Pdu::Submit(p) => p.encode_body(&mut body),
-            Pdu::SubmitResp(p) => p.encode_body(&mut body),
-            Pdu::Deliver(p) => p.encode_body(&mut body),
-            Pdu::DeliverResp(p) => p.encode_body(&mut body),
-            Pdu::ActiveTest | Pdu::Terminate | Pdu::TerminateResp => {}
-            Pdu::ActiveTestResp => body.put_u8(0),
+            Pdu::Connect(_) => 27,
+            Pdu::ConnectResp(_) => 18,
+            Pdu::Submit(p) => p.body_len_hint(),
+            Pdu::SubmitResp(_) | Pdu::DeliverResp(_) => 9,
+            Pdu::Deliver(p) => p.body_len_hint(),
+            Pdu::ActiveTest | Pdu::Terminate | Pdu::TerminateResp => 0,
+            Pdu::ActiveTestResp => 1,
         }
-        frame(self.command_id(), sequence_id, &body)
     }
 
     /// 根据已解析的 header 和 body bytes decode PDU。
@@ -101,24 +127,43 @@ impl Pdu {
             CMPP_SUBMIT_RESP => Pdu::SubmitResp(SubmitResp::decode(body)?),
             CMPP_DELIVER => Pdu::Deliver(Deliver::decode(body)?),
             CMPP_DELIVER_RESP => Pdu::DeliverResp(DeliverResp::decode(body)?),
-            CMPP_ACTIVE_TEST => Pdu::ActiveTest,
-            CMPP_ACTIVE_TEST_RESP => Pdu::ActiveTestResp,
-            CMPP_TERMINATE => Pdu::Terminate,
-            CMPP_TERMINATE_RESP => Pdu::TerminateResp,
+            CMPP_ACTIVE_TEST => {
+                require_body_len(body, 0, "CMPP_ACTIVE_TEST")?;
+                Pdu::ActiveTest
+            }
+            CMPP_ACTIVE_TEST_RESP => {
+                require_body_len(body, 1, "CMPP_ACTIVE_TEST_RESP")?;
+                Pdu::ActiveTestResp
+            }
+            CMPP_TERMINATE => {
+                require_body_len(body, 0, "CMPP_TERMINATE")?;
+                Pdu::Terminate
+            }
+            CMPP_TERMINATE_RESP => {
+                require_body_len(body, 0, "CMPP_TERMINATE_RESP")?;
+                Pdu::TerminateResp
+            }
             other => return Err(Error::Decode(format!("未知 command id {:#010x}", other))),
         })
     }
 }
 
-/// 构造 framed message：12-byte header 后跟 `body`。
-fn frame(command_id: u32, sequence_id: u32, body: &[u8]) -> Bytes {
-    let total_length = (CMPP_HEADER_LENGTH + body.len()) as u32;
-    let mut out = BytesMut::with_capacity(total_length as usize);
-    out.put_u32(total_length);
-    out.put_u32(command_id);
-    out.put_u32(sequence_id);
-    out.put_slice(body);
-    out.freeze()
+/// 直接向目标缓冲写完整 frame；容量 hint 只用于预分配，线包长度取实际写入值。
+fn encode_frame_into(
+    dst: &mut BytesMut,
+    command_id: u32,
+    sequence_id: u32,
+    body_len_hint: usize,
+    encode_body: impl FnOnce(&mut BytesMut),
+) {
+    let start = dst.len();
+    dst.reserve(CMPP_HEADER_LENGTH + body_len_hint);
+    dst.put_u32(0);
+    dst.put_u32(command_id);
+    dst.put_u32(sequence_id);
+    encode_body(dst);
+    let total_length = (dst.len() - start) as u32;
+    dst[start..start + 4].copy_from_slice(&total_length.to_be_bytes());
 }
 
 /// `CMPP_CONNECT` body.
@@ -167,6 +212,7 @@ impl Connect {
         let authenticator_source: [u8; 16] = r.take(16)?.try_into().unwrap();
         let version = r.u8()?;
         let timestamp = r.u32()?;
+        r.finish("CMPP_CONNECT")?;
         Ok(Connect {
             source_addr,
             authenticator_source,
@@ -235,6 +281,7 @@ impl ConnectResp {
         let status = r.u8()?;
         let authenticator_ismg: [u8; 16] = r.take(16)?.try_into().unwrap();
         let version = r.u8()?;
+        r.finish("CMPP_CONNECT_RESP")?;
         Ok(ConnectResp {
             status,
             authenticator_ismg,
@@ -287,6 +334,24 @@ pub struct Submit {
 }
 
 impl Submit {
+    pub(crate) fn encode(&self, sequence_id: u32) -> Bytes {
+        let mut out = BytesMut::with_capacity(CMPP_HEADER_LENGTH + self.body_len_hint());
+        encode_frame_into(
+            &mut out,
+            CMPP_SUBMIT,
+            sequence_id,
+            self.body_len_hint(),
+            |body| self.encode_body(body),
+        );
+        out.freeze()
+    }
+
+    fn body_len_hint(&self) -> usize {
+        126usize
+            .saturating_add(self.dest_terminal_ids.len().saturating_mul(21))
+            .saturating_add(self.msg_content.len())
+    }
+
     fn encode_body(&self, buf: &mut BytesMut) {
         buf.put_slice(&self.msg_id);
         buf.put_u8(self.pk_total);
@@ -334,12 +399,24 @@ impl Submit {
         let at_time = read_octet_str(r.take(17)?);
         let src_id = read_octet_str(r.take(21)?);
         let dest_count = r.u8()? as usize;
+        let minimum_remaining = dest_count
+            .checked_mul(21)
+            .and_then(|dest_bytes| dest_bytes.checked_add(1 + 8))
+            .ok_or_else(|| Error::Decode("CMPP_SUBMIT destination 长度溢出".to_string()))?;
+        if r.remaining() < minimum_remaining {
+            return Err(Error::Decode(format!(
+                "CMPP_SUBMIT destination 数量与 body 长度不匹配: count={}",
+                dest_count
+            )));
+        }
         let mut dest_terminal_ids = Vec::with_capacity(dest_count);
         for _ in 0..dest_count {
             dest_terminal_ids.push(read_octet_str(r.take(21)?));
         }
         let msg_length = r.u8()? as usize;
         let msg_content = r.take(msg_length)?.to_vec();
+        r.take(8)?;
+        r.finish("CMPP_SUBMIT")?;
         Ok(Submit {
             msg_id,
             pk_total,
@@ -383,6 +460,7 @@ impl SubmitResp {
         let mut r = BodyReader::new(body);
         let msg_id: [u8; 8] = r.take(8)?.try_into().unwrap();
         let result = r.u8()?;
+        r.finish("CMPP_SUBMIT_RESP")?;
         Ok(SubmitResp { msg_id, result })
     }
 }
@@ -421,6 +499,10 @@ impl Deliver {
         }
     }
 
+    fn body_len_hint(&self) -> usize {
+        73usize.saturating_add(self.msg_content.len())
+    }
+
     fn encode_body(&self, buf: &mut BytesMut) {
         buf.put_slice(&self.msg_id);
         put_octet_str(buf, &self.dest_id, 21);
@@ -447,6 +529,8 @@ impl Deliver {
         let registered_delivery = r.u8()?;
         let msg_length = r.u8()? as usize;
         let msg_content = r.take(msg_length)?.to_vec();
+        r.take(8)?;
+        r.finish("CMPP_DELIVER")?;
         Ok(Deliver {
             msg_id,
             dest_id,
@@ -480,6 +564,7 @@ impl DeliverResp {
         let mut r = BodyReader::new(body);
         let msg_id: [u8; 8] = r.take(8)?.try_into().unwrap();
         let result = r.u8()?;
+        r.finish("CMPP_DELIVER_RESP")?;
         Ok(DeliverResp { msg_id, result })
     }
 }
@@ -554,6 +639,18 @@ fn read_octet_str(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
+fn require_body_len(body: &[u8], expected: usize, pdu: &str) -> Result<()> {
+    if body.len() != expected {
+        return Err(Error::Decode(format!(
+            "{} body 长度无效: 期望 {}，实际 {}",
+            pdu,
+            expected,
+            body.len()
+        )));
+    }
+    Ok(())
+}
+
 /// 对 PDU body 进行 bounds-check 的 cursor。
 struct BodyReader<'a> {
     buf: &'a [u8],
@@ -568,7 +665,9 @@ impl<'a> BodyReader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let buf: &'a [u8] = self.buf;
         let start = self.pos;
-        let end = start + n;
+        let Some(end) = start.checked_add(n) else {
+            return Err(Error::Decode("body offset 溢出".to_string()));
+        };
         if end > buf.len() {
             return Err(Error::Decode(format!(
                 "body 意外结束: 需要 {} bytes（offset {}），实际有 {}",
@@ -588,6 +687,21 @@ impl<'a> BodyReader<'a> {
     fn u32(&mut self) -> Result<u32> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    fn finish(&self, pdu: &str) -> Result<()> {
+        if self.pos != self.buf.len() {
+            return Err(Error::Decode(format!(
+                "{} body 存在 {} 个尾随 bytes",
+                pdu,
+                self.buf.len() - self.pos
+            )));
+        }
+        Ok(())
     }
 }
 

@@ -64,31 +64,6 @@ pub struct SmsSegment {
     pub content: Vec<u8>,
 }
 
-/// 将单个字符 encode 到目标 charset。
-///
-/// 对 UCS2 而言，non-BMP 字符会生成 4-byte surrogate pair。这里会将其保持为整体，
-/// 因此 concatenated splitting 不会拆开 surrogate pair。
-fn encode_char(c: char, enc: SmsEncoding) -> Vec<u8> {
-    match enc {
-        SmsEncoding::Ascii => vec![c as u8],
-        SmsEncoding::Ucs2 => {
-            let mut buf = [0u16; 2];
-            let units = c.encode_utf16(&mut buf);
-            let mut out = Vec::with_capacity(units.len() * 2);
-            for u in units.iter() {
-                out.extend_from_slice(&u.to_be_bytes());
-            }
-            out
-        }
-        SmsEncoding::Gbk => {
-            let mut tmp = [0u8; 4];
-            let s = c.encode_utf8(&mut tmp);
-            let (cow, _, _) = GBK.encode(s);
-            cow.into_owned()
-        }
-    }
-}
-
 /// 为内容选择 charset：纯 ASCII 使用 single-byte ASCII（fmt=0），其他内容使用
 /// 可安全 round-trip 所有 Unicode 的 UCS2（fmt=8）。
 pub fn choose_encoding(content: &str) -> SmsEncoding {
@@ -101,11 +76,20 @@ pub fn choose_encoding(content: &str) -> SmsEncoding {
 
 /// 使用给定 charset encode 完整内容（不拆分）。
 pub fn encode_content(content: &str, enc: SmsEncoding) -> Vec<u8> {
-    let mut out = Vec::new();
-    for c in content.chars() {
-        out.extend_from_slice(&encode_char(c, enc));
+    match enc {
+        SmsEncoding::Ascii => content.chars().map(|c| c as u8).collect(),
+        SmsEncoding::Ucs2 => {
+            let mut out = Vec::with_capacity(content.len().saturating_mul(2));
+            for unit in content.encode_utf16() {
+                out.extend_from_slice(&unit.to_be_bytes());
+            }
+            out
+        }
+        SmsEncoding::Gbk => {
+            let (encoded, _, _) = GBK.encode(content);
+            encoded.into_owned()
+        }
     }
-    out
 }
 
 /// 将 DELIVER PDU 中的 Msg_Content bytes decode 为可读字符串。
@@ -144,35 +128,57 @@ pub fn split_content(content: &str) -> Vec<SmsSegment> {
     let enc = choose_encoding(content);
     let msg_fmt = enc.msg_fmt();
 
-    // 按字符生成 encoded unit，确保不会在字符内部拆分。
-    let units: Vec<Vec<u8>> = content.chars().map(|c| encode_char(c, enc)).collect();
-    let total_bytes: usize = units.iter().map(|u| u.len()).sum();
+    let total_bytes = match enc {
+        SmsEncoding::Ascii => content.len(),
+        SmsEncoding::Ucs2 => content
+            .chars()
+            .map(|character| character.len_utf16().saturating_mul(2))
+            .sum(),
+        SmsEncoding::Gbk => unreachable!("choose_encoding 不会选择 GBK"),
+    };
 
     if total_bytes <= SINGLE_MAX_BYTES {
-        let mut body = Vec::with_capacity(total_bytes);
-        for u in &units {
-            body.extend_from_slice(u);
-        }
         return vec![SmsSegment {
             msg_fmt,
             tp_udhi: 0,
             pk_total: 1,
             pk_number: 1,
-            content: body,
+            content: encode_content(content, enc),
         }];
     }
 
     // 贪心地将完整字符打包成不超过 MULTIPART_MAX_BYTES 的 chunks。
-    let mut chunks: Vec<Vec<u8>> = Vec::new();
-    let mut current: Vec<u8> = Vec::new();
-    for u in &units {
-        if !current.is_empty() && current.len() + u.len() > MULTIPART_MAX_BYTES {
-            chunks.push(std::mem::take(&mut current));
+    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(total_bytes.div_ceil(MULTIPART_MAX_BYTES));
+    match enc {
+        SmsEncoding::Ascii => {
+            chunks.extend(
+                content
+                    .as_bytes()
+                    .chunks(MULTIPART_MAX_BYTES)
+                    .map(<[u8]>::to_vec),
+            );
         }
-        current.extend_from_slice(u);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
+        SmsEncoding::Ucs2 => {
+            let mut current = Vec::with_capacity(MULTIPART_MAX_BYTES);
+            for character in content.chars() {
+                let mut utf16 = [0u16; 2];
+                let units = character.encode_utf16(&mut utf16);
+                let encoded_len = units.len() * 2;
+                if !current.is_empty() && current.len() + encoded_len > MULTIPART_MAX_BYTES {
+                    chunks.push(std::mem::replace(
+                        &mut current,
+                        Vec::with_capacity(MULTIPART_MAX_BYTES),
+                    ));
+                }
+                for unit in units {
+                    current.extend_from_slice(&unit.to_be_bytes());
+                }
+            }
+            if !current.is_empty() {
+                chunks.push(current);
+            }
+        }
+        SmsEncoding::Gbk => unreachable!("choose_encoding 不会选择 GBK"),
     }
 
     let total = chunks.len().min(255) as u8;

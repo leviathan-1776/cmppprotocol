@@ -8,11 +8,10 @@ pub(crate) const CMPP_MAX_MESSAGE_LENGTH: usize = 65536;
 pub const CMPP_HEADER_LENGTH: usize = 12;
 pub(crate) const SEND_CHANNEL_CAPACITY: usize = 1000;
 pub(crate) const INCOMING_CHANNEL_CAPACITY: usize = 1000;
-pub(crate) const CODEC_INITIAL_CAPACITY: usize = 65536;
+pub(crate) const CODEC_INITIAL_CAPACITY: usize = 4096;
 
 // Timer task 间隔
 pub(crate) const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-pub(crate) const TIMEOUT_CHECK_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// CMPP 2.0 protocol version byte。
 pub const CMPP_VERSION_20: u8 = 0x20;

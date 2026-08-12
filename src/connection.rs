@@ -7,11 +7,11 @@
 //! DELIVER（status reports / MO）、submit timeout 和连接断开，都会通过
 //! [`CmppConnection::take_events`] 返回的 channel 作为 [`Event`] 送达。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -30,13 +30,17 @@ use crate::pdu::{Connect, Deliver, DeliverResp, Frame, Pdu, Submit, compute_auth
 use crate::submit::SubmitOptions;
 use crate::types::{
     CODEC_INITIAL_CAPACITY, INCOMING_CHANNEL_CAPACITY, SEND_CHANNEL_CAPACITY,
-    TIMEOUT_CHECK_IDLE_INTERVAL, TIMEOUT_CHECK_INTERVAL,
+    TIMEOUT_CHECK_INTERVAL,
 };
 
 const EVENT_SPOOL_NORMAL_CAPACITY: usize = 256;
 const EVENT_SPOOL_EMERGENCY_CAPACITY: usize = 2;
 const CONTROL_CHANNEL_CAPACITY: usize = 64;
 const CONTROL_BURST_LIMIT: usize = 16;
+const MAX_SUBMIT_RETRY_SPREAD_TICKS: usize = 4;
+const MAX_MANUAL_SEQUENCE_BATCHES: usize = 4;
+const MAX_RETIRED_SEQUENCE_IDS: usize = 65_536;
+const SUBMIT_TIMEOUT_LOG_SAMPLES: usize = 4;
 
 /// [`CmppConnection`] 产生的 async event。
 ///
@@ -125,6 +129,153 @@ struct EventTicket {
     _guard: Option<EventTicketGuard>,
 }
 
+struct SequenceState {
+    next: u32,
+    reserved: HashSet<u32>,
+    retired: HashSet<u32>,
+}
+
+struct SequenceRegistry {
+    state: StdMutex<SequenceState>,
+}
+
+impl SequenceRegistry {
+    fn new(next: u32, capacity: usize) -> Self {
+        SequenceRegistry {
+            state: StdMutex::new(SequenceState {
+                next: next.max(1),
+                reserved: HashSet::with_capacity(capacity),
+                retired: HashSet::new(),
+            }),
+        }
+    }
+
+    fn reserve_next(self: &Arc<Self>) -> Option<SequenceLease> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let start = state.next.max(1);
+        let mut sequence_id = start;
+        loop {
+            if !state.retired.contains(&sequence_id) && state.reserved.insert(sequence_id) {
+                state.next = next_nonzero_sequence(sequence_id);
+                return Some(SequenceLease {
+                    sequence_id,
+                    registry: self.clone(),
+                    manual: false,
+                    release_on_drop: true,
+                });
+            }
+            sequence_id = next_nonzero_sequence(sequence_id);
+            if sequence_id == start || state.reserved.len() == u32::MAX as usize {
+                return None;
+            }
+        }
+    }
+
+    fn reserve_batch(self: &Arc<Self>, base: u32, count: usize) -> Option<Vec<SequenceLease>> {
+        if count > u8::MAX as usize {
+            return None;
+        }
+        let mut ids = Vec::with_capacity(count);
+        let mut seen = HashSet::with_capacity(count);
+        for index in 0..count {
+            let sequence_id = base.wrapping_add(index as u32);
+            if !seen.insert(sequence_id) {
+                return None;
+            }
+            ids.push(sequence_id);
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ids
+            .iter()
+            .any(|id| state.reserved.contains(id) || state.retired.contains(id))
+        {
+            return None;
+        }
+        state.reserved.extend(ids.iter().copied());
+        let mut checked = 0usize;
+        while state.reserved.contains(&state.next) && checked <= state.reserved.len() {
+            state.next = next_nonzero_sequence(state.next);
+            checked += 1;
+        }
+        Some(
+            ids.into_iter()
+                .map(|sequence_id| SequenceLease {
+                    sequence_id,
+                    registry: self.clone(),
+                    manual: true,
+                    release_on_drop: true,
+                })
+                .collect(),
+        )
+    }
+
+    fn release(&self, sequence_id: u32) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reserved
+            .remove(&sequence_id);
+    }
+
+    fn retire(&self, sequence_id: u32) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.retired.contains(&sequence_id) {
+            state.reserved.remove(&sequence_id);
+            return true;
+        }
+        if state.retired.len() >= MAX_RETIRED_SEQUENCE_IDS {
+            return false;
+        }
+        state.reserved.remove(&sequence_id);
+        state.retired.insert(sequence_id);
+        true
+    }
+}
+
+struct SequenceLease {
+    sequence_id: u32,
+    registry: Arc<SequenceRegistry>,
+    manual: bool,
+    release_on_drop: bool,
+}
+
+impl SequenceLease {
+    fn id(&self) -> u32 {
+        self.sequence_id
+    }
+
+    /// 手动 sequence 上线或最终超时后立即隔离，避免迟到响应误配。
+    fn retire(&mut self) -> bool {
+        self.release_on_drop = false;
+        self.registry.retire(self.sequence_id)
+    }
+}
+
+impl Drop for SequenceLease {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.registry.release(self.sequence_id);
+        }
+    }
+}
+
+fn next_nonzero_sequence(sequence_id: u32) -> u32 {
+    match sequence_id.wrapping_add(1) {
+        0 => 1,
+        next => next,
+    }
+}
+
 impl EventTicket {
     fn publish(mut self, event: Event) -> bool {
         self.event_tx
@@ -150,10 +301,46 @@ enum EventReservationError {
 
 /// 正在等待 response 的 SUBMIT，用于 sliding-window 计数和重传跟踪。
 struct PendingSubmit {
+    submission_id: u64,
     packet: Bytes,
-    retry_count: u32,
-    last_send_time: Instant,
+    state: SubmitAttemptState,
+    _sequence_lease: SequenceLease,
     _window_permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubmitAttemptState {
+    Queued { attempt: u32 },
+    Writing { attempt: u32 },
+    AwaitingResponse { attempt: u32, written_at: Instant },
+    RespondedWhileWriting { attempt: u32 },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SubmitAttemptKey {
+    sequence_id: u32,
+    submission_id: u64,
+    attempt: u32,
+}
+
+struct PendingHeartbeat {
+    heartbeat_id: u64,
+    state: HeartbeatAttemptState,
+    _sequence_lease: SequenceLease,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeartbeatAttemptState {
+    Queued { attempt: u32 },
+    Writing { attempt: u32 },
+    AwaitingResponse { attempt: u32, written_at: Instant },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HeartbeatAttemptKey {
+    sequence_id: u32,
+    heartbeat_id: u64,
+    attempt: u32,
 }
 
 struct Outbound {
@@ -164,6 +351,8 @@ struct Outbound {
     marks_peer_terminate_response: bool,
     open_only: bool,
     submit_drain_marker: bool,
+    submit_attempt: Option<SubmitAttemptKey>,
+    heartbeat_attempt: Option<HeartbeatAttemptKey>,
     event_after_write: Option<(EventTicket, Event)>,
 }
 
@@ -177,6 +366,8 @@ impl Outbound {
             marks_peer_terminate_response: false,
             open_only: false,
             submit_drain_marker: false,
+            submit_attempt: None,
+            heartbeat_attempt: None,
             event_after_write: None,
         }
     }
@@ -192,6 +383,8 @@ impl Outbound {
                 marks_peer_terminate_response: false,
                 open_only: false,
                 submit_drain_marker: false,
+                submit_attempt: None,
+                heartbeat_attempt: None,
                 event_after_write: None,
             },
             written_rx,
@@ -224,9 +417,21 @@ impl Outbound {
         (outbound, written_rx)
     }
 
+    fn submit(packet: Bytes, key: SubmitAttemptKey) -> Self {
+        let mut outbound = Self::plain(packet);
+        outbound.submit_attempt = Some(key);
+        outbound
+    }
+
     fn open_only(packet: Bytes) -> Self {
         let mut outbound = Self::plain(packet);
         outbound.open_only = true;
+        outbound
+    }
+
+    fn heartbeat(packet: Bytes, key: HeartbeatAttemptKey) -> Self {
+        let mut outbound = Self::open_only(packet);
+        outbound.heartbeat_attempt = Some(key);
         outbound
     }
 
@@ -241,6 +446,7 @@ struct PendingTerminate {
     sequence_id: u32,
     response_tx: oneshot::Sender<()>,
     written: Arc<AtomicBool>,
+    _sequence_lease: SequenceLease,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,7 +459,9 @@ enum ConnectionPhase {
 
 /// `Arc` 后面的共享 connection state。
 struct Inner {
-    seq_generator: AtomicU32,
+    sequence_registry: Arc<SequenceRegistry>,
+    submission_id_generator: AtomicU64,
+    heartbeat_id_generator: AtomicU64,
     submit_tx: mpsc::Sender<Outbound>,
     control_tx: mpsc::Sender<Outbound>,
     event_spool_tx: mpsc::Sender<EventSpoolItem>,
@@ -264,8 +472,9 @@ struct Inner {
     terminal_reason: StdMutex<Option<Error>>,
     pending_submits: RwLock<HashMap<u32, PendingSubmit>>,
     window_semaphore: Arc<Semaphore>,
+    manual_batch_semaphore: Arc<Semaphore>,
     submit_admission: StdMutex<()>,
-    heartbeat_pending: RwLock<HashMap<u32, (Instant, u32)>>,
+    heartbeat_pending: RwLock<HashMap<u32, PendingHeartbeat>>,
     phase: AtomicU8,
     phase_tx: watch::Sender<ConnectionPhase>,
     external_handles: AtomicUsize,
@@ -282,37 +491,17 @@ struct Inner {
     runtime_handle: tokio::runtime::Handle,
     response_timeout: Duration,
     retry_count: u32,
+    window_size: usize,
+    submit_retry_batch_size: usize,
 }
 
 impl Inner {
-    fn next_seq_id(&self) -> u32 {
-        let seq = self.seq_generator.fetch_add(1, Ordering::SeqCst);
-        if seq == 0 {
-            self.seq_generator
-                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-                .ok();
-            1
-        } else {
-            seq
-        }
+    fn next_submission_id(&self) -> u64 {
+        self.submission_id_generator.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// 确保自增 sequence generator 始终高于手动分配的 id。
-    fn bump_seq_generator(&self, used: u32) {
-        loop {
-            let current = self.seq_generator.load(Ordering::SeqCst);
-            let floor = used.saturating_add(1).max(1);
-            if current >= floor {
-                break;
-            }
-            if self
-                .seq_generator
-                .compare_exchange_weak(current, floor, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                break;
-            }
-        }
+    fn next_heartbeat_id(&self) -> u64 {
+        self.heartbeat_id_generator.fetch_add(1, Ordering::Relaxed)
     }
 
     fn phase(&self) -> ConnectionPhase {
@@ -369,6 +558,107 @@ impl Inner {
     /// 丢弃所有 pending SUBMIT；其 owned permit 会随 entry 一同释放。
     async fn fail_all_pending(&self) {
         self.pending_submits.write().await.clear();
+    }
+
+    /// 领取一个已入队的 SUBMIT attempt。领取后必须完整写完该 frame，避免半包。
+    async fn claim_submit_attempt(&self, key: SubmitAttemptKey) -> bool {
+        let mut pending = self.pending_submits.write().await;
+        let _admission = self
+            .submit_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let phase = self.phase();
+        if phase != ConnectionPhase::Open
+            && !(phase == ConnectionPhase::Closing
+                && self.drain_submits_on_close.load(Ordering::SeqCst))
+        {
+            return false;
+        }
+        let Some(entry) = pending.get_mut(&key.sequence_id) else {
+            return false;
+        };
+        if entry.submission_id != key.submission_id
+            || !matches!(
+                entry.state,
+                SubmitAttemptState::Queued { attempt } if attempt == key.attempt
+            )
+        {
+            return false;
+        }
+        entry.state = SubmitAttemptState::Writing {
+            attempt: key.attempt,
+        };
+        true
+    }
+
+    /// 完整写出后才启动 response timeout；若写入期间已收到响应，则在这里释放窗口。
+    async fn complete_submit_attempt(&self, key: SubmitAttemptKey, written_at: Instant) {
+        let mut pending = self.pending_submits.write().await;
+        let should_remove = pending.get_mut(&key.sequence_id).is_some_and(|entry| {
+            if entry.submission_id != key.submission_id {
+                return false;
+            }
+            match entry.state {
+                SubmitAttemptState::Writing { attempt } if attempt == key.attempt => {
+                    entry.state = SubmitAttemptState::AwaitingResponse {
+                        attempt: key.attempt,
+                        written_at,
+                    };
+                    false
+                }
+                SubmitAttemptState::RespondedWhileWriting { attempt } if attempt == key.attempt => {
+                    true
+                }
+                _ => false,
+            }
+        });
+        if should_remove {
+            pending.remove(&key.sequence_id);
+        }
+    }
+
+    async fn claim_heartbeat_attempt(&self, key: HeartbeatAttemptKey) -> bool {
+        let mut pending = self.heartbeat_pending.write().await;
+        let _admission = self
+            .submit_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.phase() != ConnectionPhase::Open {
+            return false;
+        }
+        let Some(entry) = pending.get_mut(&key.sequence_id) else {
+            return false;
+        };
+        if entry.heartbeat_id != key.heartbeat_id
+            || !matches!(
+                entry.state,
+                HeartbeatAttemptState::Queued { attempt } if attempt == key.attempt
+            )
+        {
+            return false;
+        }
+        entry.state = HeartbeatAttemptState::Writing {
+            attempt: key.attempt,
+        };
+        true
+    }
+
+    async fn complete_heartbeat_attempt(&self, key: HeartbeatAttemptKey, written_at: Instant) {
+        let mut pending = self.heartbeat_pending.write().await;
+        let Some(entry) = pending.get_mut(&key.sequence_id) else {
+            return;
+        };
+        if entry.heartbeat_id == key.heartbeat_id
+            && matches!(
+                entry.state,
+                HeartbeatAttemptState::Writing { attempt } if attempt == key.attempt
+            )
+        {
+            entry.state = HeartbeatAttemptState::AwaitingResponse {
+                attempt: key.attempt,
+                written_at,
+            };
+        }
     }
 
     fn make_event_ticket(&self, track_until_publish: bool) -> std::result::Result<EventTicket, ()> {
@@ -547,9 +837,11 @@ impl Inner {
         drop(terminal_reason);
         self.drain_submits_on_close.store(false, Ordering::SeqCst);
         self.window_semaphore.close();
+        self.manual_batch_semaphore.close();
         let inner = self.clone();
         let cleanup = async move {
             inner.fail_all_pending().await;
+            inner.heartbeat_pending.write().await.clear();
             inner.pending_terminate.lock().await.take();
             inner.close_event_spool();
             inner.cleanup_complete_tx.send_replace(true);
@@ -729,6 +1021,10 @@ impl CmppConnection {
 
         // --- 装配运行中的 connection ---
         let window_size = params.window_size;
+        let submit_retry_batch_size = window_size
+            .div_ceil(MAX_SUBMIT_RETRY_SPREAD_TICKS)
+            .max(1)
+            .min(window_size);
         let (submit_tx, submit_rx) = mpsc::channel::<Outbound>(SEND_CHANNEL_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel::<Outbound>(CONTROL_CHANNEL_CAPACITY);
         let (event_spool_tx, event_spool_rx) = mpsc::channel::<EventSpoolItem>(
@@ -746,7 +1042,9 @@ impl CmppConnection {
         });
 
         let inner = Arc::new(Inner {
-            seq_generator: AtomicU32::new(2), // seq 1 已由 CONNECT 使用
+            sequence_registry: Arc::new(SequenceRegistry::new(2, window_size + 2)),
+            submission_id_generator: AtomicU64::new(1),
+            heartbeat_id_generator: AtomicU64::new(1),
             submit_tx,
             control_tx,
             event_spool_tx,
@@ -755,10 +1053,13 @@ impl CmppConnection {
             event_tickets,
             event_overflowed: AtomicBool::new(false),
             terminal_reason: StdMutex::new(None),
-            pending_submits: RwLock::new(HashMap::new()),
+            pending_submits: RwLock::new(HashMap::with_capacity(window_size)),
             window_semaphore: Arc::new(Semaphore::new(window_size)),
+            manual_batch_semaphore: Arc::new(Semaphore::new(
+                window_size.min(MAX_MANUAL_SEQUENCE_BATCHES),
+            )),
             submit_admission: StdMutex::new(()),
-            heartbeat_pending: RwLock::new(HashMap::new()),
+            heartbeat_pending: RwLock::new(HashMap::with_capacity(1)),
             phase: AtomicU8::new(ConnectionPhase::Open as u8),
             phase_tx,
             external_handles: AtomicUsize::new(1),
@@ -775,6 +1076,8 @@ impl CmppConnection {
             runtime_handle: tokio::runtime::Handle::current(),
             response_timeout: Duration::from_secs(params.response_timeout),
             retry_count: params.retry_count,
+            window_size,
+            submit_retry_batch_size,
         });
 
         let dispatcher_handle = tokio::spawn(event_dispatcher_task(event_spool_rx, events_tx));
@@ -849,24 +1152,52 @@ impl CmppConnection {
 
         let submits = options.build_submits(content);
         let mut seq_ids = Vec::with_capacity(submits.len());
-
-        for (i, submit) in submits.into_iter().enumerate() {
-            let seq = match base_sequence_id {
-                Some(base) => {
-                    let seq = base.wrapping_add(i as u32);
-                    self.inner.bump_seq_generator(seq);
-                    seq
+        let mut phase_rx = self.inner.phase_tx.subscribe();
+        let _manual_batch_permit = if base_sequence_id.is_some() {
+            Some(tokio::select! {
+                biased;
+                _ = wait_until_not_open(&mut phase_rx) => return Err(Error::Closed),
+                result = self.inner.manual_batch_semaphore.clone().acquire_owned() => {
+                    result.map_err(|_| Error::Closed)?
                 }
-                None => self.inner.next_seq_id(),
+            })
+        } else {
+            None
+        };
+        let mut manual_sequence_leases = if let Some(base) = base_sequence_id {
+            Some(
+                self.inner
+                    .sequence_registry
+                    .reserve_batch(base, submits.len())
+                    .ok_or_else(|| {
+                        Error::Config(
+                            "base_sequence_id 区间超过 255 段、包含重复值或已被当前 connection 使用"
+                                .to_string(),
+                        )
+                    })?
+                    .into_iter(),
+            )
+        } else {
+            None
+        };
+
+        for submit in submits {
+            let sequence_lease = match manual_sequence_leases.as_mut() {
+                Some(leases) => Some(leases.next().ok_or(Error::ChannelClosed)?),
+                None => None,
             };
-            self.send_submit(seq, submit).await?;
-            seq_ids.push(seq);
+            let sequence_id = self.send_submit(sequence_lease, submit).await?;
+            seq_ids.push(sequence_id);
         }
 
         Ok(seq_ids)
     }
 
-    async fn send_submit(&self, sequence_id: u32, submit: Submit) -> Result<()> {
+    async fn send_submit(
+        &self,
+        sequence_lease: Option<SequenceLease>,
+        submit: Submit,
+    ) -> Result<u32> {
         let mut phase_rx = self.inner.phase_tx.subscribe();
         let permit = tokio::select! {
             biased;
@@ -876,7 +1207,21 @@ impl CmppConnection {
             }
         };
 
-        let bytes = Pdu::Submit(Box::new(submit)).encode(sequence_id);
+        let mut sequence_lease = match sequence_lease {
+            Some(lease) => lease,
+            None => self
+                .inner
+                .sequence_registry
+                .reserve_next()
+                .ok_or(Error::ChannelClosed)?,
+        };
+        let sequence_id = sequence_lease.id();
+        let bytes = submit.encode(sequence_id);
+        let key = SubmitAttemptKey {
+            sequence_id,
+            submission_id: self.inner.next_submission_id(),
+            attempt: 1,
+        };
         let submit_tx = self.inner.submit_tx.clone();
         let queue_permit = tokio::select! {
             biased;
@@ -901,17 +1246,24 @@ impl CmppConnection {
         if self.inner.phase() != ConnectionPhase::Open {
             return Err(Error::Closed);
         }
+        if sequence_lease.manual && !sequence_lease.retire() {
+            drop(_admission);
+            drop(pending);
+            self.inner.finish(Some(Error::ChannelClosed));
+            return Err(Error::ChannelClosed);
+        }
         pending.insert(
             sequence_id,
             PendingSubmit {
+                submission_id: key.submission_id,
                 packet: bytes.clone(),
-                retry_count: 0,
-                last_send_time: Instant::now(),
+                state: SubmitAttemptState::Queued { attempt: 1 },
+                _sequence_lease: sequence_lease,
                 _window_permit: permit,
             },
         );
-        queue_permit.send(Outbound::plain(bytes));
-        Ok(())
+        queue_permit.send(Outbound::submit(bytes, key));
+        Ok(sequence_id)
     }
 
     /// 优雅关闭 connection：发送 CMPP_TERMINATE，然后拆除。
@@ -1006,13 +1358,20 @@ async fn graceful_close_task(inner: Arc<Inner>, background_tasks: Arc<Mutex<Vec<
         log::debug!("优雅关闭的 SUBMIT 排空在 connection 关闭前未完成");
     }
 
-    let term_seq = inner.next_seq_id();
+    let Some(sequence_lease) = inner.sequence_registry.reserve_next() else {
+        log::error!("无法为 CMPP_TERMINATE 分配 sequence id");
+        inner.finish(Some(Error::ChannelClosed));
+        reap_background_tasks(inner, background_tasks).await;
+        return;
+    };
+    let term_seq = sequence_lease.id();
     let (response_tx, response_rx) = oneshot::channel();
     let written = Arc::new(AtomicBool::new(false));
     *inner.pending_terminate.lock().await = Some(PendingTerminate {
         sequence_id: term_seq,
         response_tx,
         written: written.clone(),
+        _sequence_lease: sequence_lease,
     });
     let (outbound, written_rx) =
         Outbound::local_terminate(Pdu::Terminate.encode(term_seq), written);
@@ -1110,6 +1469,7 @@ async fn reap_background_tasks(
         log::warn!("等待 CMPP connection cleanup 完成超时，执行幂等兜底清理");
         let fallback_result = tokio::time::timeout(inner.response_timeout, async {
             inner.fail_all_pending().await;
+            inner.heartbeat_pending.write().await.clear();
             inner.pending_terminate.lock().await.take();
             inner.close_event_spool();
             inner.cleanup_complete_tx.send_replace(true);
@@ -1241,30 +1601,6 @@ async fn send_until_closed(
     send_outbound_until_closed(tx, Outbound::plain(bytes), phase_rx).await
 }
 
-async fn send_while_open(
-    tx: &mpsc::Sender<Outbound>,
-    bytes: Bytes,
-    phase_rx: &mut watch::Receiver<ConnectionPhase>,
-) -> std::result::Result<(), ()> {
-    tokio::select! {
-        biased;
-        _ = wait_until_not_open(phase_rx) => Err(()),
-        result = tx.send(Outbound::plain(bytes)) => result.map_err(|_| ()),
-    }
-}
-
-async fn send_open_only_control(
-    tx: &mpsc::Sender<Outbound>,
-    bytes: Bytes,
-    phase_rx: &mut watch::Receiver<ConnectionPhase>,
-) -> std::result::Result<(), ()> {
-    tokio::select! {
-        biased;
-        _ = wait_until_not_open(phase_rx) => Err(()),
-        result = tx.send(Outbound::open_only(bytes)) => result.map_err(|_| ()),
-    }
-}
-
 async fn event_dispatcher_task(
     mut event_spool_rx: mpsc::Receiver<EventSpoolItem>,
     events_tx: mpsc::Sender<Event>,
@@ -1377,13 +1713,38 @@ async fn writer_task(
             }
             continue;
         }
+        let submit_attempt = if is_submit {
+            let Some(key) = outbound.submit_attempt else {
+                log::error!("submit queue 中存在缺少 attempt metadata 的报文");
+                inner.finish(Some(Error::ChannelClosed));
+                break;
+            };
+            if !inner.claim_submit_attempt(key).await {
+                log::debug!(
+                    "跳过过期 SUBMIT attempt: seq_id={}, attempt={}",
+                    key.sequence_id,
+                    key.attempt
+                );
+                continue;
+            }
+            Some(key)
+        } else {
+            None
+        };
+        let heartbeat_attempt = if let Some(key) = outbound.heartbeat_attempt {
+            if !inner.claim_heartbeat_attempt(key).await {
+                log::debug!(
+                    "跳过过期 ACTIVE_TEST attempt: seq_id={}, attempt={}",
+                    key.sequence_id,
+                    key.attempt
+                );
+                continue;
+            }
+            Some(key)
+        } else {
+            None
+        };
         let phase = inner.phase();
-        if is_submit
-            && phase != ConnectionPhase::Open
-            && !inner.drain_submits_on_close.load(Ordering::SeqCst)
-        {
-            continue;
-        }
         if outbound.open_only && phase != ConnectionPhase::Open {
             continue;
         }
@@ -1414,6 +1775,13 @@ async fn writer_task(
         };
         match write_result {
             Ok(()) => {
+                let written_at = Instant::now();
+                if let Some(key) = submit_attempt {
+                    inner.complete_submit_attempt(key, written_at).await;
+                }
+                if let Some(key) = heartbeat_attempt {
+                    inner.complete_heartbeat_attempt(key, written_at).await;
+                }
                 if outbound.marks_peer_terminate_response {
                     inner
                         .peer_terminate_response_written
@@ -1463,11 +1831,27 @@ async fn reader_task(
         let Frame { sequence_id, pdu } = frame;
         match pdu {
             Pdu::SubmitResp(resp) => {
-                let pending = {
+                let handled = {
                     let mut map = inner.pending_submits.write().await;
-                    map.remove(&sequence_id)
+                    match map.get(&sequence_id).map(|entry| entry.state) {
+                        Some(SubmitAttemptState::Writing { attempt }) => {
+                            if let Some(entry) = map.get_mut(&sequence_id) {
+                                entry.state = SubmitAttemptState::RespondedWhileWriting { attempt };
+                            }
+                            true
+                        }
+                        Some(SubmitAttemptState::RespondedWhileWriting { .. }) => false,
+                        Some(
+                            SubmitAttemptState::Queued { .. }
+                            | SubmitAttemptState::AwaitingResponse { .. },
+                        ) => {
+                            map.remove(&sequence_id);
+                            true
+                        }
+                        None => false,
+                    }
                 };
-                if pending.is_some() {
+                if handled {
                     if inner.event_overflowed.load(Ordering::Acquire) {
                         log::debug!(
                             "event backlog 关闭期间收到 SUBMIT_RESP seq_id={}，仅完成协议状态迁移",
@@ -1481,7 +1865,7 @@ async fn reader_task(
                         });
                     }
                 } else {
-                    log::debug!("收到未知 seq_id={} 的 SUBMIT_RESP", sequence_id);
+                    log::debug!("收到未知或重复 seq_id={} 的 SUBMIT_RESP", sequence_id);
                 }
             }
             Pdu::Deliver(deliver) => {
@@ -1613,26 +1997,52 @@ async fn heartbeat_task(
         if has_pending {
             continue;
         }
-        let seq = inner.next_seq_id();
-        if send_open_only_control(
-            &inner.control_tx,
-            Pdu::ActiveTest.encode(seq),
-            &mut phase_rx,
-        )
-        .await
-        .is_ok()
-        {
-            inner
-                .heartbeat_pending
-                .write()
-                .await
-                .insert(seq, (Instant::now(), 0));
-        } else {
-            if inner.phase() == ConnectionPhase::Open {
-                inner.finish(Some(Error::ChannelClosed));
+        let Some(sequence_lease) = inner.sequence_registry.reserve_next() else {
+            inner.finish(Some(Error::ChannelClosed));
+            break;
+        };
+        let key = HeartbeatAttemptKey {
+            sequence_id: sequence_lease.id(),
+            heartbeat_id: inner.next_heartbeat_id(),
+            attempt: 1,
+        };
+        let control_tx = inner.control_tx.clone();
+        let queue_permit = tokio::select! {
+            biased;
+            _ = wait_until_not_open(&mut phase_rx) => break,
+            result = control_tx.reserve_owned() => match result {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if inner.phase() == ConnectionPhase::Open {
+                        inner.finish(Some(Error::ChannelClosed));
+                    }
+                    break;
+                }
             }
+        };
+        let mut pending = inner.heartbeat_pending.write().await;
+        let _admission = inner
+            .submit_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.phase() != ConnectionPhase::Open {
             break;
         }
+        if !pending.is_empty() {
+            continue;
+        }
+        pending.insert(
+            key.sequence_id,
+            PendingHeartbeat {
+                heartbeat_id: key.heartbeat_id,
+                state: HeartbeatAttemptState::Queued { attempt: 1 },
+                _sequence_lease: sequence_lease,
+            },
+        );
+        queue_permit.send(Outbound::heartbeat(
+            Pdu::ActiveTest.encode(key.sequence_id),
+            key,
+        ));
     }
     log::debug!("heartbeat task 已退出");
 }
@@ -1641,8 +2051,13 @@ async fn heartbeat_task(
 async fn timeout_task(inner: Arc<Inner>, mut phase_rx: watch::Receiver<ConnectionPhase>) {
     let timeout = inner.response_timeout;
     let retry_count = inner.retry_count;
-    let mut ticker = tokio::time::interval(TIMEOUT_CHECK_INTERVAL);
+    let active_check_interval =
+        (timeout / MAX_SUBMIT_RETRY_SPREAD_TICKS as u32).min(TIMEOUT_CHECK_INTERVAL);
+    let mut ticker = tokio::time::interval(active_check_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut expired_submits: Vec<(Instant, SubmitAttemptKey)> =
+        Vec::with_capacity(inner.window_size);
+    let mut timeout_samples = Vec::with_capacity(SUBMIT_TIMEOUT_LOG_SAMPLES);
 
     loop {
         tokio::select! {
@@ -1652,41 +2067,88 @@ async fn timeout_task(inner: Arc<Inner>, mut phase_rx: watch::Receiver<Connectio
         }
         let now = Instant::now();
 
-        // Heartbeat timeout（持锁更新 state，释放后再发送）。
+        // Heartbeat 同样从完整写出后开始 timeout，不把队列等待误算为网络超时。
+        let expired_heartbeat = {
+            let pending = inner.heartbeat_pending.read().await;
+            pending
+                .iter()
+                .find_map(|(&sequence_id, heartbeat)| match heartbeat.state {
+                    HeartbeatAttemptState::AwaitingResponse {
+                        attempt,
+                        written_at,
+                    } if now.duration_since(written_at) >= timeout => Some(HeartbeatAttemptKey {
+                        sequence_id,
+                        heartbeat_id: heartbeat.heartbeat_id,
+                        attempt,
+                    }),
+                    _ => None,
+                })
+        };
         let mut exhausted = false;
-        let mut hb_retransmit: Vec<u32> = Vec::new();
-        {
-            let mut hb = inner.heartbeat_pending.write().await;
-            let mut remove: Vec<u32> = Vec::new();
-            for (seq, (sent, retry)) in hb.iter_mut() {
-                if now.duration_since(*sent) >= timeout {
-                    if *retry >= retry_count - 1 {
-                        exhausted = true;
-                        remove.push(*seq);
-                    } else {
-                        *retry += 1;
-                        *sent = now;
-                        hb_retransmit.push(*seq);
+        if let Some(key) = expired_heartbeat {
+            if key.attempt >= retry_count {
+                let mut pending = inner.heartbeat_pending.write().await;
+                let still_expired = pending.get(&key.sequence_id).is_some_and(|heartbeat| {
+                    heartbeat.heartbeat_id == key.heartbeat_id
+                        && matches!(
+                            heartbeat.state,
+                            HeartbeatAttemptState::AwaitingResponse { attempt, .. }
+                                if attempt == key.attempt
+                        )
+                });
+                if still_expired {
+                    pending.remove(&key.sequence_id);
+                    exhausted = true;
+                }
+            } else {
+                let queue_permit = match inner.control_tx.clone().try_reserve_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(mpsc::error::TrySendError::Full(_)) => None,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        if inner.phase() == ConnectionPhase::Open {
+                            inner.finish(Some(Error::ChannelClosed));
+                        }
+                        return;
+                    }
+                };
+                if let Some(queue_permit) = queue_permit {
+                    let next_key = HeartbeatAttemptKey {
+                        attempt: key.attempt + 1,
+                        ..key
+                    };
+                    let mut pending = inner.heartbeat_pending.write().await;
+                    let _admission = inner
+                        .submit_admission
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let valid = pending.get_mut(&key.sequence_id).is_some_and(|heartbeat| {
+                        if inner.phase() != ConnectionPhase::Open
+                            || heartbeat.heartbeat_id != key.heartbeat_id
+                            || !matches!(
+                                heartbeat.state,
+                                HeartbeatAttemptState::AwaitingResponse { attempt, .. }
+                                    if attempt == key.attempt
+                            )
+                        {
+                            return false;
+                        }
+                        heartbeat.state = HeartbeatAttemptState::Queued {
+                            attempt: next_key.attempt,
+                        };
+                        true
+                    });
+                    if valid {
+                        queue_permit.send(Outbound::heartbeat(
+                            Pdu::ActiveTest.encode(key.sequence_id),
+                            next_key,
+                        ));
+                        log::debug!(
+                            "正在重传 ACTIVE_TEST seq_id={}, attempt={}",
+                            key.sequence_id,
+                            next_key.attempt
+                        );
                     }
                 }
-            }
-            for seq in remove {
-                hb.remove(&seq);
-            }
-        }
-        for seq in hb_retransmit {
-            if send_open_only_control(
-                &inner.control_tx,
-                Pdu::ActiveTest.encode(seq),
-                &mut phase_rx,
-            )
-            .await
-            .is_err()
-            {
-                if inner.phase() == ConnectionPhase::Open {
-                    inner.finish(Some(Error::ChannelClosed));
-                }
-                return;
             }
         }
         if exhausted {
@@ -1695,62 +2157,145 @@ async fn timeout_task(inner: Arc<Inner>, mut phase_rx: watch::Receiver<Connectio
             return;
         }
 
-        // SUBMIT timeout。
-        let (has_pending, retransmit, gave_up) = {
-            let mut map = inner.pending_submits.write().await;
-            let mut retransmit: Vec<(u32, Bytes)> = Vec::new();
-            let mut gave_up_candidates: Vec<u32> = Vec::new();
-            for (seq, p) in map.iter_mut() {
-                if now.duration_since(p.last_send_time) >= timeout {
-                    if p.retry_count >= retry_count - 1 {
-                        gave_up_candidates.push(*seq);
+        // SUBMIT timeout：只检查已经完整写出的 attempt，并按最老优先平滑处理。
+        expired_submits.clear();
+        {
+            let map = inner.pending_submits.read().await;
+            expired_submits.extend(map.iter().filter_map(|(&sequence_id, pending)| {
+                match pending.state {
+                    SubmitAttemptState::AwaitingResponse {
+                        attempt,
+                        written_at,
+                    } if now.duration_since(written_at) >= timeout => Some((
+                        written_at,
+                        SubmitAttemptKey {
+                            sequence_id,
+                            submission_id: pending.submission_id,
+                            attempt,
+                        },
+                    )),
+                    _ => None,
+                }
+            }));
+        }
+        expired_submits.sort_unstable_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.sequence_id.cmp(&right.1.sequence_id))
+                .then_with(|| left.1.submission_id.cmp(&right.1.submission_id))
+        });
+        expired_submits.truncate(inner.submit_retry_batch_size);
+        timeout_samples.clear();
+        let mut timed_out_submits = 0usize;
+
+        for (_, key) in expired_submits.drain(..) {
+            if key.attempt >= retry_count {
+                let ticket = {
+                    let mut map = inner.pending_submits.write().await;
+                    let still_expired = map.get(&key.sequence_id).is_some_and(|pending| {
+                        pending.submission_id == key.submission_id
+                            && matches!(
+                                pending.state,
+                                SubmitAttemptState::AwaitingResponse { attempt, .. }
+                                    if attempt == key.attempt
+                            )
+                    });
+                    if !still_expired {
+                        None
                     } else {
-                        p.retry_count += 1;
-                        p.last_send_time = now;
-                        retransmit.push((*seq, p.packet.clone()));
+                        match inner.reserve_event(true, false) {
+                            Ok(ticket) => {
+                                if let Some(mut pending) = map.remove(&key.sequence_id) {
+                                    let retired = pending._sequence_lease.retire();
+                                    Some((ticket, retired))
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                };
+                if let Some((ticket, retired)) = ticket {
+                    let _ = ticket.publish(Event::SubmitTimeout {
+                        sequence_id: key.sequence_id,
+                    });
+                    timed_out_submits += 1;
+                    if timeout_samples.len() < SUBMIT_TIMEOUT_LOG_SAMPLES {
+                        timeout_samples.push(key.sequence_id);
+                    }
+                    if !retired {
+                        log_submit_timeout_batch(timed_out_submits, &timeout_samples);
+                        log::error!("sequence 隔离表已满，正在关闭 connection");
+                        inner.finish(Some(Error::ChannelClosed));
+                        return;
                     }
                 }
+                continue;
             }
-            let mut gave_up: Vec<(u32, EventTicket)> = Vec::new();
-            for seq in gave_up_candidates {
-                let ticket = match inner.reserve_event(true, false) {
-                    Ok(ticket) => ticket,
-                    Err(_) => break,
-                };
-                if map.remove(&seq).is_some() {
-                    gave_up.push((seq, ticket));
-                }
-            }
-            let has_pending = !map.is_empty();
-            (has_pending, retransmit, gave_up)
-        };
-        for (seq, ticket) in gave_up {
-            log::warn!("SUBMIT timeout，放弃重试: seq_id={}", seq);
-            let _ = ticket.publish(Event::SubmitTimeout { sequence_id: seq });
-        }
-        if inner.phase() != ConnectionPhase::Open {
-            return;
-        }
-        for (seq, packet) in retransmit {
-            if send_while_open(&inner.submit_tx, packet, &mut phase_rx)
-                .await
-                .is_ok()
-            {
-                log::debug!("正在重传 SUBMIT seq_id={}", seq);
-            } else {
-                if inner.phase() == ConnectionPhase::Open {
-                    inner.finish(Some(Error::ChannelClosed));
-                }
-                return;
-            }
-        }
 
-        let next_check = if has_pending {
-            TIMEOUT_CHECK_INTERVAL
-        } else {
-            TIMEOUT_CHECK_IDLE_INTERVAL
-        };
-        ticker.reset_after(next_check);
+            let queue_permit = match inner.submit_tx.clone().try_reserve_owned() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Full(_)) => continue,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    if inner.phase() == ConnectionPhase::Open {
+                        inner.finish(Some(Error::ChannelClosed));
+                    }
+                    return;
+                }
+            };
+            let next_key = SubmitAttemptKey {
+                attempt: key.attempt + 1,
+                ..key
+            };
+            let committed = {
+                let mut map = inner.pending_submits.write().await;
+                let _admission = inner
+                    .submit_admission
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(pending) = map.get_mut(&key.sequence_id) else {
+                    continue;
+                };
+                if inner.phase() != ConnectionPhase::Open
+                    || pending.submission_id != key.submission_id
+                    || !matches!(
+                        pending.state,
+                        SubmitAttemptState::AwaitingResponse { attempt, .. }
+                            if attempt == key.attempt
+                    )
+                {
+                    false
+                } else {
+                    let packet = pending.packet.clone();
+                    pending.state = SubmitAttemptState::Queued {
+                        attempt: next_key.attempt,
+                    };
+                    queue_permit.send(Outbound::submit(packet, next_key));
+                    true
+                }
+            };
+            if committed {
+                log::debug!(
+                    "正在重传 SUBMIT seq_id={}, attempt={}",
+                    key.sequence_id,
+                    next_key.attempt
+                );
+            }
+        }
+        log_submit_timeout_batch(timed_out_submits, &timeout_samples);
+
+        ticker.reset_after(active_check_interval);
     }
     log::debug!("timeout task 已退出");
+}
+
+fn log_submit_timeout_batch(count: usize, samples: &[u32]) {
+    if count != 0 {
+        log::warn!(
+            "SUBMIT timeout，批量放弃重试: count={}, sample_seq_ids={:?}",
+            count,
+            samples
+        );
+    }
 }

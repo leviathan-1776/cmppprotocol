@@ -3,7 +3,7 @@
 use crate::error::Error;
 use crate::pdu::{Frame, Pdu};
 use crate::types::{CMPP_HEADER_LENGTH, CMPP_MAX_MESSAGE_LENGTH, CmppHeader};
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder};
 
 /// CMPP frame codec：处理半包/不完整读取和 length-prefixed framing，
@@ -23,7 +23,7 @@ impl Decoder for CmppFrameCodec {
 
         let total_length = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
 
-        if total_length < CMPP_HEADER_LENGTH || total_length > CMPP_MAX_MESSAGE_LENGTH {
+        if !(CMPP_HEADER_LENGTH..=CMPP_MAX_MESSAGE_LENGTH).contains(&total_length) {
             return Err(Error::Decode(format!(
                 "message length 无效: {}，期望范围 [{}, {}]",
                 total_length, CMPP_HEADER_LENGTH, CMPP_MAX_MESSAGE_LENGTH
@@ -32,7 +32,7 @@ impl Decoder for CmppFrameCodec {
 
         if src.len() < total_length {
             let needed = total_length - src.len();
-            src.reserve(needed);
+            src.reserve(needed.min(crate::types::CODEC_INITIAL_CAPACITY));
             return Ok(None);
         }
 
@@ -53,9 +53,7 @@ impl Encoder<Frame> for CmppFrameCodec {
     type Error = Error;
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let bytes = item.encode();
-        dst.reserve(bytes.len());
-        dst.put_slice(&bytes);
+        item.encode_into(dst);
         Ok(())
     }
 }
@@ -64,6 +62,7 @@ impl Encoder<Frame> for CmppFrameCodec {
 mod tests {
     use super::*;
     use crate::pdu::{ConnectResp, SubmitResp};
+    use bytes::BufMut;
 
     #[test]
     fn decodes_full_frame() {
