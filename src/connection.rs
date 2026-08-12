@@ -7,9 +7,13 @@
 //! DELIVER（status reports / MO）、submit timeout 和连接断开，都会通过
 //! [`CmppConnection::take_events`] 返回的 channel 作为 [`Event`] 送达。
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::hash_map::RandomState;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::future::Future;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -41,6 +45,11 @@ const MAX_SUBMIT_RETRY_SPREAD_TICKS: usize = 4;
 const MAX_MANUAL_SEQUENCE_BATCHES: usize = 4;
 const MAX_RETIRED_SEQUENCE_IDS: usize = 65_536;
 const SUBMIT_TIMEOUT_LOG_SAMPLES: usize = 4;
+const UDH_REFERENCE_BUCKET_COUNT: usize = 4096;
+const DEFAULT_UDH_REFERENCE_COOLDOWN: Duration = Duration::from_secs(300);
+const MAX_UDH_REFERENCE_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+
+static UDH_REFERENCE_POOL: LazyLock<UdhReferencePool> = LazyLock::new(UdhReferencePool::new);
 
 /// [`CmppConnection`] 产生的 async event。
 ///
@@ -129,8 +138,176 @@ struct EventTicket {
     _guard: Option<EventTicketGuard>,
 }
 
+#[derive(Default)]
+struct UdhReferenceBucket {
+    active: [u64; 4],
+    cooling: [u64; 4],
+    cooldowns: BinaryHeap<Reverse<(Instant, u8)>>,
+}
+
+struct UdhReferencePool {
+    state: StdMutex<Vec<UdhReferenceBucket>>,
+    hash_builder: RandomState,
+}
+
+struct UdhReferenceLease {
+    bucket_ids: Box<[usize]>,
+    reference: u8,
+    cooldown: Duration,
+    exposed: AtomicBool,
+}
+
+impl UdhReferencePool {
+    fn new() -> Self {
+        UdhReferencePool {
+            state: StdMutex::new(
+                std::iter::repeat_with(UdhReferenceBucket::default)
+                    .take(UDH_REFERENCE_BUCKET_COUNT)
+                    .collect(),
+            ),
+            hash_builder: RandomState::new(),
+        }
+    }
+
+    fn bucket_ids(&self, src_id: &str, destinations: &[String]) -> Box<[usize]> {
+        let source = normalize_udh_address(src_id);
+        let mut bucket_ids = Vec::with_capacity(destinations.len().max(1));
+        if destinations.is_empty() {
+            bucket_ids.push(self.bucket_id(&source, &[0; 21]));
+        } else {
+            bucket_ids.extend(
+                destinations.iter().map(|destination| {
+                    self.bucket_id(&source, &normalize_udh_address(destination))
+                }),
+            );
+            bucket_ids.sort_unstable();
+            bucket_ids.dedup();
+        }
+        bucket_ids.into_boxed_slice()
+    }
+
+    fn bucket_id(&self, source: &[u8; 21], destination: &[u8; 21]) -> usize {
+        let mut hasher = self.hash_builder.build_hasher();
+        source.hash(&mut hasher);
+        destination.hash(&mut hasher);
+        (hasher.finish() as usize) & (UDH_REFERENCE_BUCKET_COUNT - 1)
+    }
+
+    fn try_acquire(
+        &'static self,
+        bucket_ids: Box<[usize]>,
+        preferred: u8,
+        cooldown: Duration,
+    ) -> Option<Arc<UdhReferenceLease>> {
+        let now = Instant::now();
+        let mut buckets = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for &bucket_id in bucket_ids.iter() {
+            purge_udh_cooldowns(&mut buckets[bucket_id], now);
+        }
+
+        for offset in 0..=u8::MAX {
+            let reference = preferred.wrapping_add(offset);
+            if bucket_ids
+                .iter()
+                .all(|&bucket_id| !udh_reference_is_set(&buckets[bucket_id], reference))
+            {
+                for &bucket_id in bucket_ids.iter() {
+                    set_udh_reference(&mut buckets[bucket_id].active, reference);
+                }
+                return Some(Arc::new(UdhReferenceLease {
+                    bucket_ids,
+                    reference,
+                    cooldown,
+                    exposed: AtomicBool::new(false),
+                }));
+            }
+        }
+        None
+    }
+
+    fn release(&self, lease: &UdhReferenceLease) {
+        let now = Instant::now();
+        let exposed = lease.exposed.load(Ordering::Acquire);
+        let deadline = exposed.then(|| now.checked_add(lease.cooldown)).flatten();
+        let mut buckets = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for &bucket_id in lease.bucket_ids.iter() {
+            let bucket = &mut buckets[bucket_id];
+            clear_udh_reference(&mut bucket.active, lease.reference);
+            if exposed {
+                set_udh_reference(&mut bucket.cooling, lease.reference);
+                if let Some(deadline) = deadline {
+                    bucket.cooldowns.push(Reverse((deadline, lease.reference)));
+                }
+            }
+        }
+        drop(buckets);
+    }
+}
+
+impl UdhReferenceLease {
+    fn reference(&self) -> u8 {
+        self.reference
+    }
+
+    fn mark_exposed(&self) {
+        self.exposed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for UdhReferenceLease {
+    fn drop(&mut self) {
+        UDH_REFERENCE_POOL.release(self);
+    }
+}
+
+fn normalize_udh_address(value: &str) -> [u8; 21] {
+    let mut normalized = [0u8; 21];
+    let bytes = value.as_bytes();
+    let length = bytes.len().min(normalized.len());
+    normalized[..length].copy_from_slice(&bytes[..length]);
+    normalized
+}
+
+fn udh_reference_position(reference: u8) -> (usize, u64) {
+    let index = reference as usize;
+    (index / 64, 1u64 << (index % 64))
+}
+
+fn udh_reference_is_set(bucket: &UdhReferenceBucket, reference: u8) -> bool {
+    let (word, mask) = udh_reference_position(reference);
+    (bucket.active[word] | bucket.cooling[word]) & mask != 0
+}
+
+fn set_udh_reference(bitmap: &mut [u64; 4], reference: u8) {
+    let (word, mask) = udh_reference_position(reference);
+    bitmap[word] |= mask;
+}
+
+fn clear_udh_reference(bitmap: &mut [u64; 4], reference: u8) {
+    let (word, mask) = udh_reference_position(reference);
+    bitmap[word] &= !mask;
+}
+
+fn purge_udh_cooldowns(bucket: &mut UdhReferenceBucket, now: Instant) {
+    while let Some(Reverse((deadline, reference))) = bucket.cooldowns.peek().copied() {
+        if deadline > now {
+            break;
+        }
+        bucket.cooldowns.pop();
+        clear_udh_reference(&mut bucket.cooling, reference);
+    }
+}
+
 struct SequenceState {
-    next: u32,
+    next_automatic: Option<u32>,
+    automatic_start: u32,
+    automatic_used_through: Option<u32>,
     reserved: HashSet<u32>,
     retired: HashSet<u32>,
 }
@@ -141,9 +318,12 @@ struct SequenceRegistry {
 
 impl SequenceRegistry {
     fn new(next: u32, capacity: usize) -> Self {
+        let next = next.max(1);
         SequenceRegistry {
             state: StdMutex::new(SequenceState {
-                next: next.max(1),
+                next_automatic: Some(next),
+                automatic_start: next,
+                automatic_used_through: None,
                 reserved: HashSet::with_capacity(capacity),
                 retired: HashSet::new(),
             }),
@@ -155,21 +335,20 @@ impl SequenceRegistry {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let start = state.next.max(1);
-        let mut sequence_id = start;
         loop {
-            if !state.retired.contains(&sequence_id) && state.reserved.insert(sequence_id) {
-                state.next = next_nonzero_sequence(sequence_id);
+            let sequence_id = state.next_automatic?;
+            state.automatic_used_through = Some(sequence_id);
+            state.next_automatic = sequence_id.checked_add(1);
+            if state.retired.remove(&sequence_id) {
+                continue;
+            }
+            if state.reserved.insert(sequence_id) {
                 return Some(SequenceLease {
                     sequence_id,
                     registry: self.clone(),
                     manual: false,
                     release_on_drop: true,
                 });
-            }
-            sequence_id = next_nonzero_sequence(sequence_id);
-            if sequence_id == start || state.reserved.len() == u32::MAX as usize {
-                return None;
             }
         }
     }
@@ -192,18 +371,16 @@ impl SequenceRegistry {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if ids
-            .iter()
-            .any(|id| state.reserved.contains(id) || state.retired.contains(id))
-        {
+        if ids.iter().any(|id| {
+            state
+                .automatic_used_through
+                .is_some_and(|used_through| *id >= state.automatic_start && *id <= used_through)
+                || state.reserved.contains(id)
+                || state.retired.contains(id)
+        }) {
             return None;
         }
         state.reserved.extend(ids.iter().copied());
-        let mut checked = 0usize;
-        while state.reserved.contains(&state.next) && checked <= state.reserved.len() {
-            state.next = next_nonzero_sequence(state.next);
-            checked += 1;
-        }
         Some(
             ids.into_iter()
                 .map(|sequence_id| SequenceLease {
@@ -229,6 +406,12 @@ impl SequenceRegistry {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.automatic_used_through.is_some_and(|used_through| {
+            sequence_id >= state.automatic_start && sequence_id <= used_through
+        }) {
+            state.reserved.remove(&sequence_id);
+            return true;
+        }
         if state.retired.contains(&sequence_id) {
             state.reserved.remove(&sequence_id);
             return true;
@@ -269,13 +452,6 @@ impl Drop for SequenceLease {
     }
 }
 
-fn next_nonzero_sequence(sequence_id: u32) -> u32 {
-    match sequence_id.wrapping_add(1) {
-        0 => 1,
-        next => next,
-    }
-}
-
 impl EventTicket {
     fn publish(mut self, event: Event) -> bool {
         self.event_tx
@@ -304,6 +480,7 @@ struct PendingSubmit {
     submission_id: u64,
     packet: Bytes,
     state: SubmitAttemptState,
+    _udh_reference_lease: Option<Arc<UdhReferenceLease>>,
     _sequence_lease: SequenceLease,
     _window_permit: OwnedSemaphorePermit,
 }
@@ -345,6 +522,7 @@ struct HeartbeatAttemptKey {
 
 struct Outbound {
     packet: Bytes,
+    response_budget_started_at: Option<Instant>,
     written_tx: Option<oneshot::Sender<()>>,
     written_flag: Option<Arc<AtomicBool>>,
     cancel_after_peer_terminate: bool,
@@ -360,6 +538,7 @@ impl Outbound {
     fn plain(packet: Bytes) -> Self {
         Outbound {
             packet,
+            response_budget_started_at: None,
             written_tx: None,
             written_flag: None,
             cancel_after_peer_terminate: false,
@@ -377,6 +556,7 @@ impl Outbound {
         (
             Outbound {
                 packet,
+                response_budget_started_at: None,
                 written_tx: Some(written_tx),
                 written_flag: None,
                 cancel_after_peer_terminate: false,
@@ -407,14 +587,16 @@ impl Outbound {
         (outbound, written_rx)
     }
 
-    fn tracked_event(
+    fn event_after_write(
         packet: Bytes,
+        response_budget_started_at: Instant,
         ticket: EventTicket,
         event: Event,
-    ) -> (Self, oneshot::Receiver<()>) {
-        let (mut outbound, written_rx) = Self::tracked(packet);
+    ) -> Self {
+        let mut outbound = Self::plain(packet);
+        outbound.response_budget_started_at = Some(response_budget_started_at);
         outbound.event_after_write = Some((ticket, event));
-        (outbound, written_rx)
+        outbound
     }
 
     fn submit(packet: Bytes, key: SubmitAttemptKey) -> Self {
@@ -489,6 +671,7 @@ struct Inner {
     peer_terminate_seen: AtomicBool,
     peer_terminate_response_written: AtomicBool,
     runtime_handle: tokio::runtime::Handle,
+    udh_reference_cooldown: Duration,
     response_timeout: Duration,
     retry_count: u32,
     window_size: usize,
@@ -919,7 +1102,23 @@ impl CmppConnection {
     /// 只有成功收到 `CMPP_CONNECT_RESP` 后才返回；status 非零时返回 [`Error::Auth`]，
     /// 并且（除非在 config 中禁用）会校验 `AuthenticatorISMG`。
     pub async fn connect(config: CmppConfig) -> Result<CmppConnection> {
+        Self::connect_with_udh_reference_cooldown(config, DEFAULT_UDH_REFERENCE_COOLDOWN).await
+    }
+
+    /// 连接到 ISMG，并指定已上线长短信的 8-bit UDH reference 隔离时间。
+    ///
+    /// cooldown 期间，同一实际 `Src_Id + Dest_Terminal_Id` 不会复用该 reference，
+    /// 避免网关或终端将迟到分片与新长短信错误重组。
+    pub async fn connect_with_udh_reference_cooldown(
+        config: CmppConfig,
+        udh_reference_cooldown: Duration,
+    ) -> Result<CmppConnection> {
         config.validate().map_err(Error::Config)?;
+        if udh_reference_cooldown.is_zero() || udh_reference_cooldown > MAX_UDH_REFERENCE_COOLDOWN {
+            return Err(Error::Config(
+                "UDH reference cooldown 必须在 1ns 到 24h 之间".to_string(),
+            ));
+        }
 
         let params = config.protocol_params.clone();
         let stream = setup_tcp(&config).await?;
@@ -1074,6 +1273,7 @@ impl CmppConnection {
             peer_terminate_seen: AtomicBool::new(false),
             peer_terminate_response_written: AtomicBool::new(false),
             runtime_handle: tokio::runtime::Handle::current(),
+            udh_reference_cooldown,
             response_timeout: Duration::from_secs(params.response_timeout),
             retry_count: params.retry_count,
             window_size,
@@ -1135,8 +1335,9 @@ impl CmppConnection {
 
     /// Submit message，并为每个 SMS segment 返回一个 sequence id。
     ///
-    /// Non-blocking：调用只会在 sliding-window backpressure（window 已满）时等待，
-    /// 随后立即返回。对应的 `SUBMIT_RESP` 会以 async 形式作为 [`Event::SubmitResp`]
+    /// Non-blocking：调用只会在 sliding-window backpressure 时等待。同一重组域的
+    /// 8-bit UDH reference 全部占用时会立即返回 [`Error::Config`]。对应的
+    /// `SUBMIT_RESP` 会以 async 形式作为 [`Event::SubmitResp`]
     /// 到达（或到达 [`Event::SubmitTimeout`]）。内容会自动 encode 并拆分（long SMS）。
     /// 当 `base_sequence_id` 为 `Some` 时，long SMS segment 会使用从该值开始的连续
     /// sequence id；否则由内部自动分配 sequence id。
@@ -1150,7 +1351,30 @@ impl CmppConnection {
             return Err(Error::Closed);
         }
 
-        let submits = options.build_submits(content);
+        let mut submits = options.try_build_submits(content)?;
+        let udh_reference_lease = if submits.len() > 1 {
+            let preferred = submits
+                .first()
+                .and_then(|submit| submit.msg_content.get(3))
+                .copied()
+                .ok_or_else(|| Error::Config("long SMS UDH 无效".to_string()))?;
+            let bucket_ids =
+                UDH_REFERENCE_POOL.bucket_ids(&options.src_id, &options.dest_terminal_ids);
+            let lease = UDH_REFERENCE_POOL
+                .try_acquire(bucket_ids, preferred, self.inner.udh_reference_cooldown)
+                .ok_or_else(|| {
+                    Error::Config("同一短信重组域的 8-bit UDH reference 已全部占用".to_string())
+                })?;
+            for submit in &mut submits {
+                let Some(reference) = submit.msg_content.get_mut(3) else {
+                    return Err(Error::Config("long SMS UDH 无效".to_string()));
+                };
+                *reference = lease.reference();
+            }
+            Some(lease)
+        } else {
+            None
+        };
         let mut seq_ids = Vec::with_capacity(submits.len());
         let mut phase_rx = self.inner.phase_tx.subscribe();
         let _manual_batch_permit = if base_sequence_id.is_some() {
@@ -1186,7 +1410,9 @@ impl CmppConnection {
                 Some(leases) => Some(leases.next().ok_or(Error::ChannelClosed)?),
                 None => None,
             };
-            let sequence_id = self.send_submit(sequence_lease, submit).await?;
+            let sequence_id = self
+                .send_submit(sequence_lease, submit, udh_reference_lease.clone())
+                .await?;
             seq_ids.push(sequence_id);
         }
 
@@ -1197,6 +1423,7 @@ impl CmppConnection {
         &self,
         sequence_lease: Option<SequenceLease>,
         submit: Submit,
+        udh_reference_lease: Option<Arc<UdhReferenceLease>>,
     ) -> Result<u32> {
         let mut phase_rx = self.inner.phase_tx.subscribe();
         let permit = tokio::select! {
@@ -1209,14 +1436,16 @@ impl CmppConnection {
 
         let mut sequence_lease = match sequence_lease {
             Some(lease) => lease,
-            None => self
-                .inner
-                .sequence_registry
-                .reserve_next()
-                .ok_or(Error::ChannelClosed)?,
+            None => match self.inner.sequence_registry.reserve_next() {
+                Some(lease) => lease,
+                None => {
+                    self.inner.finish(Some(Error::ChannelClosed));
+                    return Err(Error::ChannelClosed);
+                }
+            },
         };
         let sequence_id = sequence_lease.id();
-        let bytes = submit.encode(sequence_id);
+        let bytes = submit.try_encode(sequence_id)?;
         let key = SubmitAttemptKey {
             sequence_id,
             submission_id: self.inner.next_submission_id(),
@@ -1252,12 +1481,16 @@ impl CmppConnection {
             self.inner.finish(Some(Error::ChannelClosed));
             return Err(Error::ChannelClosed);
         }
+        if let Some(lease) = &udh_reference_lease {
+            lease.mark_exposed();
+        }
         pending.insert(
             sequence_id,
             PendingSubmit {
                 submission_id: key.submission_id,
                 packet: bytes.clone(),
                 state: SubmitAttemptState::Queued { attempt: 1 },
+                _udh_reference_lease: udh_reference_lease,
                 _sequence_lease: sequence_lease,
                 _window_permit: permit,
             },
@@ -1756,22 +1989,40 @@ async fn writer_task(
             log::debug!("peer TERMINATE 已完成响应，取消尚未写出的本地 TERMINATE");
             continue;
         }
-        let write_result = tokio::select! {
+        let deliver_response_budget = outbound.response_budget_started_at.is_some();
+        let write_timeout = match outbound.response_budget_started_at {
+            Some(started_at) => match inner.response_timeout.checked_sub(started_at.elapsed()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                _ => {
+                    log::warn!("CMPP DELIVER_RESP pipeline 响应超时");
+                    inner.finish(Some(Error::Timeout));
+                    break;
+                }
+            },
+            None => inner.response_timeout,
+        };
+        let timed_write = tokio::select! {
             biased;
             _ = wait_until_closed(&mut phase_rx) => {
                 let _ = writer.shutdown().await;
                 break;
             }
             result = tokio::time::timeout(
-                inner.response_timeout,
+                write_timeout,
                 writer.write_all(&outbound.packet),
-            ) => match result {
-                Ok(result) => result,
-                Err(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "CMPP socket write 超时",
-                )),
-            },
+            ) => result,
+        };
+        let write_result = match timed_write {
+            Ok(result) => result,
+            Err(_) if deliver_response_budget => {
+                log::warn!("CMPP DELIVER_RESP pipeline 响应超时");
+                inner.finish(Some(Error::Timeout));
+                break;
+            }
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "CMPP socket write 超时",
+            )),
         };
         match write_result {
             Ok(()) => {
@@ -1873,7 +2124,7 @@ async fn reader_task(
                     Ok(ticket) => ticket,
                     Err(EventReservationError::Overflowed) => {
                         log::debug!("event backlog 关闭期间忽略未确认的 DELIVER");
-                        continue;
+                        return;
                     }
                     Err(EventReservationError::Closed) => return,
                 };
@@ -1884,16 +2135,27 @@ async fn reader_task(
                         result: 0,
                     }),
                 );
-                let (outbound, written_rx) =
-                    Outbound::tracked_event(resp.encode(), event_ticket, Event::Deliver(deliver));
-                let response_result = tokio::time::timeout(inner.response_timeout, async {
-                    send_outbound_until_closed(&inner.control_tx, outbound, &mut phase_rx)
-                        .await
-                        .map_err(|_| ())?;
-                    written_rx.await.map_err(|_| ())
-                })
-                .await;
-                match response_result {
+                let response_budget_started_at = Instant::now();
+                let outbound = Outbound::event_after_write(
+                    resp.encode(),
+                    response_budget_started_at,
+                    event_ticket,
+                    Event::Deliver(deliver),
+                );
+                let remaining = inner
+                    .response_timeout
+                    .checked_sub(response_budget_started_at.elapsed())
+                    .filter(|remaining| !remaining.is_zero());
+                let Some(remaining) = remaining else {
+                    log::warn!("CMPP DELIVER_RESP pipeline 响应超时");
+                    break Error::Timeout;
+                };
+                match tokio::time::timeout(
+                    remaining,
+                    send_outbound_until_closed(&inner.control_tx, outbound, &mut phase_rx),
+                )
+                .await
+                {
                     Ok(Ok(())) => {}
                     Ok(Err(())) => {
                         if inner.phase() == ConnectionPhase::Closed {
@@ -1902,7 +2164,7 @@ async fn reader_task(
                         break Error::ChannelClosed;
                     }
                     Err(_) => {
-                        log::warn!("CMPP DELIVER_RESP write barrier 超时");
+                        log::warn!("CMPP DELIVER_RESP pipeline 入队超时");
                         break Error::Timeout;
                     }
                 }

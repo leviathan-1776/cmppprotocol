@@ -53,8 +53,7 @@ impl Encoder<Frame> for CmppFrameCodec {
     type Error = Error;
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        item.encode_into(dst);
-        Ok(())
+        item.try_encode_into(dst)
     }
 }
 

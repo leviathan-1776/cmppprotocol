@@ -29,12 +29,23 @@ impl Frame {
     }
 
     /// 将当前 frame 序列化为 bytes。
+    ///
+    /// # Panics
+    ///
+    /// PDU 包含无法由 CMPP 2.0 长度字段表示的值时 panic。需要处理不可信
+    /// PDU 时，请使用 [`Self::try_encode`]。
     pub fn encode(&self) -> Bytes {
-        self.pdu.encode(self.sequence_id)
+        self.try_encode()
+            .expect("PDU 无法编码为合法的 CMPP 2.0 frame")
     }
 
-    pub(crate) fn encode_into(&self, dst: &mut BytesMut) {
-        self.pdu.encode_into(self.sequence_id, dst);
+    /// 将当前 frame 序列化为 bytes，并校验 CMPP 2.0 长度字段。
+    pub fn try_encode(&self) -> Result<Bytes> {
+        self.pdu.try_encode(self.sequence_id)
+    }
+
+    pub(crate) fn try_encode_into(&self, dst: &mut BytesMut) -> Result<()> {
+        self.pdu.try_encode_into(self.sequence_id, dst)
     }
 }
 
@@ -81,13 +92,32 @@ impl Pdu {
     }
 
     /// 使用给定 sequence id 序列化当前 PDU（header + body）。
+    ///
+    /// # Panics
+    ///
+    /// PDU 包含无法由 CMPP 2.0 长度字段表示的值时 panic。需要处理不可信
+    /// PDU 时，请使用 [`Self::try_encode`]。
     pub fn encode(&self, sequence_id: u32) -> Bytes {
-        let mut out = BytesMut::with_capacity(CMPP_HEADER_LENGTH + self.body_len_hint());
-        self.encode_into(sequence_id, &mut out);
-        out.freeze()
+        self.try_encode(sequence_id)
+            .expect("PDU 无法编码为合法的 CMPP 2.0 frame")
     }
 
-    pub(crate) fn encode_into(&self, sequence_id: u32, dst: &mut BytesMut) {
+    /// 使用给定 sequence id 序列化当前 PDU（header + body），并校验
+    /// CMPP 2.0 长度字段。
+    pub fn try_encode(&self, sequence_id: u32) -> Result<Bytes> {
+        self.validate_encode()?;
+        let mut out = BytesMut::with_capacity(CMPP_HEADER_LENGTH + self.body_len_hint());
+        self.encode_into_unchecked(sequence_id, &mut out);
+        Ok(out.freeze())
+    }
+
+    pub(crate) fn try_encode_into(&self, sequence_id: u32, dst: &mut BytesMut) -> Result<()> {
+        self.validate_encode()?;
+        self.encode_into_unchecked(sequence_id, dst);
+        Ok(())
+    }
+
+    fn encode_into_unchecked(&self, sequence_id: u32, dst: &mut BytesMut) {
         encode_frame_into(
             dst,
             self.command_id(),
@@ -104,6 +134,14 @@ impl Pdu {
                 Pdu::ActiveTestResp => body.put_u8(0),
             },
         );
+    }
+
+    fn validate_encode(&self) -> Result<()> {
+        match self {
+            Pdu::Submit(p) => p.validate_encode(),
+            Pdu::Deliver(p) => p.validate_encode(),
+            _ => Ok(()),
+        }
     }
 
     fn body_len_hint(&self) -> usize {
@@ -334,7 +372,8 @@ pub struct Submit {
 }
 
 impl Submit {
-    pub(crate) fn encode(&self, sequence_id: u32) -> Bytes {
+    pub(crate) fn try_encode(&self, sequence_id: u32) -> Result<Bytes> {
+        self.validate_encode()?;
         let mut out = BytesMut::with_capacity(CMPP_HEADER_LENGTH + self.body_len_hint());
         encode_frame_into(
             &mut out,
@@ -343,7 +382,19 @@ impl Submit {
             self.body_len_hint(),
             |body| self.encode_body(body),
         );
-        out.freeze()
+        Ok(out.freeze())
+    }
+
+    fn validate_encode(&self) -> Result<()> {
+        if self.dest_terminal_ids.len() > u8::MAX as usize {
+            return Err(Error::Config("SUBMIT destination 数量超过 255".to_string()));
+        }
+        if self.msg_content.len() > u8::MAX as usize {
+            return Err(Error::Config(
+                "SUBMIT Msg_Content 长度超过 255 bytes".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn body_len_hint(&self) -> usize {
@@ -370,11 +421,11 @@ impl Submit {
         put_octet_str(buf, &self.valid_time, 17);
         put_octet_str(buf, &self.at_time, 17);
         put_octet_str(buf, &self.src_id, 21);
-        buf.put_u8(self.dest_terminal_ids.len() as u8);
+        buf.put_u8(u8::try_from(self.dest_terminal_ids.len()).expect("destination 数量已校验"));
         for d in &self.dest_terminal_ids {
             put_octet_str(buf, d, 21);
         }
-        buf.put_u8(self.msg_content.len() as u8);
+        buf.put_u8(u8::try_from(self.msg_content.len()).expect("Msg_Content 长度已校验"));
         buf.put_slice(&self.msg_content);
         buf.put_slice(&[0u8; 8]); // 保留字段
     }
@@ -503,6 +554,15 @@ impl Deliver {
         73usize.saturating_add(self.msg_content.len())
     }
 
+    fn validate_encode(&self) -> Result<()> {
+        if self.msg_content.len() > u8::MAX as usize {
+            return Err(Error::Config(
+                "DELIVER Msg_Content 长度超过 255 bytes".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn encode_body(&self, buf: &mut BytesMut) {
         buf.put_slice(&self.msg_id);
         put_octet_str(buf, &self.dest_id, 21);
@@ -512,7 +572,7 @@ impl Deliver {
         buf.put_u8(self.msg_fmt);
         put_octet_str(buf, &self.src_terminal_id, 21);
         buf.put_u8(self.registered_delivery);
-        buf.put_u8(self.msg_content.len() as u8);
+        buf.put_u8(u8::try_from(self.msg_content.len()).expect("Msg_Content 长度已校验"));
         buf.put_slice(&self.msg_content);
         buf.put_slice(&[0u8; 8]); // 保留字段
     }

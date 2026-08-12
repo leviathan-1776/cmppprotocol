@@ -4,7 +4,8 @@
 //! 它会为每个 SMS segment 生成一个 [`Submit`]（long message 通过
 //! [`crate::encoding::split_content`] 按 6-byte UDH 拆分）。
 
-use crate::encoding::split_content;
+use crate::encoding::try_split_content;
+use crate::error::{Error, Result};
 use crate::pdu::Submit;
 
 /// 待提交 message 每个 segment 共享的可配置字段。
@@ -101,8 +102,28 @@ impl SubmitOptions {
     ///
     /// 内容会按 charset encode（ASCII / UCS2），并在超过单个 140-byte PDU 时拆分为
     /// concatenated segments。
+    ///
+    /// # Panics
+    ///
+    /// destination 数量或长短信 segment 数量超过 CMPP 2.0 的 8-bit 字段
+    /// 表示范围时 panic。需要处理不可信输入时，请使用 [`Self::try_build_submits`]。
     pub fn build_submits(&self, content: &str) -> Vec<Submit> {
-        split_content(content)
+        self.try_build_submits(content)
+            .expect("无法构造合法的 CMPP 2.0 SUBMIT")
+    }
+
+    /// 为给定内容的每个 SMS segment 构造一个 [`Submit`] PDU。
+    ///
+    /// # Errors
+    ///
+    /// destination 数量或长短信 segment 数量超过 CMPP 2.0 的 8-bit 字段
+    /// 表示范围时返回 [`Error::Config`]。
+    pub fn try_build_submits(&self, content: &str) -> Result<Vec<Submit>> {
+        if self.dest_terminal_ids.len() > u8::MAX as usize {
+            return Err(Error::Config("SUBMIT destination 数量超过 255".to_string()));
+        }
+
+        Ok(try_split_content(content)?
             .into_iter()
             .map(|seg| Submit {
                 msg_id: [0u8; 8],
@@ -125,14 +146,14 @@ impl SubmitOptions {
                 dest_terminal_ids: self.dest_terminal_ids.clone(),
                 msg_content: seg.content,
             })
-            .collect()
+            .collect())
     }
 
     /// 构造恰好一个 non-concatenated SUBMIT PDU。
     ///
     /// 当内容无法放入单个 CMPP SUBMIT 时返回 `None`。
     pub fn build_short_submit(&self, content: &str) -> Option<Submit> {
-        let mut submits = self.build_submits(content);
+        let mut submits = self.try_build_submits(content).ok()?;
         if submits.len() == 1 && submits[0].tp_udhi == 0 {
             Some(submits.remove(0))
         } else {
