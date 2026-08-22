@@ -9,28 +9,29 @@
 
 use std::cmp::Reverse;
 use std::collections::hash_map::RandomState;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::future::Future;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use tokio::io::AsyncWriteExt;
+use bytes::{Bytes, BytesMut};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
-use tokio_util::codec::FramedRead;
+use tokio_util::codec::{Decoder, FramedRead};
 
 use crate::codec::CmppFrameCodec;
 use crate::config::CmppConfig;
+use crate::encoding::{SubmitContentPlan, prepare_submit_content};
 use crate::error::{Error, Result};
-use crate::pdu::{Connect, Deliver, DeliverResp, Frame, Pdu, Submit, compute_authenticator_ismg};
+use crate::pdu::{Connect, Deliver, DeliverResp, Frame, Pdu, compute_authenticator_ismg};
 use crate::submit::SubmitOptions;
 use crate::types::{
     CODEC_INITIAL_CAPACITY, INCOMING_CHANNEL_CAPACITY, SEND_CHANNEL_CAPACITY,
@@ -39,17 +40,22 @@ use crate::types::{
 
 const EVENT_SPOOL_NORMAL_CAPACITY: usize = 256;
 const EVENT_SPOOL_EMERGENCY_CAPACITY: usize = 2;
+const EVENT_DISPATCH_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_CHANNEL_CAPACITY: usize = 64;
 const CONTROL_BURST_LIMIT: usize = 16;
 const MAX_SUBMIT_RETRY_SPREAD_TICKS: usize = 4;
 const MAX_MANUAL_SEQUENCE_BATCHES: usize = 4;
-const MAX_RETIRED_SEQUENCE_IDS: usize = 65_536;
+// 退休集合按区间保存；该上限约束 BTreeMap 节点数，而不是连续区间覆盖的 ID 数量。
+const MAX_RETIRED_SEQUENCE_RANGES: usize = 65_536;
 const SUBMIT_TIMEOUT_LOG_SAMPLES: usize = 4;
+const UNEXPECTED_PDU_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const UDH_REFERENCE_BUCKET_COUNT: usize = 4096;
 const DEFAULT_UDH_REFERENCE_COOLDOWN: Duration = Duration::from_secs(300);
 const MAX_UDH_REFERENCE_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 
 static UDH_REFERENCE_POOL: LazyLock<UdhReferencePool> = LazyLock::new(UdhReferencePool::new);
+static TIMEOUT_JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LOG_MONOTONIC_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// [`CmppConnection`] 产生的 async event。
 ///
@@ -309,7 +315,8 @@ struct SequenceState {
     automatic_start: u32,
     automatic_used_through: Option<u32>,
     reserved: HashSet<u32>,
-    retired: HashSet<u32>,
+    /// 已上线的手动 sequence 以不相交闭区间保存；连续长短信只占一个区间。
+    retired: BTreeMap<u32, u32>,
 }
 
 struct SequenceRegistry {
@@ -325,7 +332,7 @@ impl SequenceRegistry {
                 automatic_start: next,
                 automatic_used_through: None,
                 reserved: HashSet::with_capacity(capacity),
-                retired: HashSet::new(),
+                retired: BTreeMap::new(),
             }),
         }
     }
@@ -339,7 +346,21 @@ impl SequenceRegistry {
             let sequence_id = state.next_automatic?;
             state.automatic_used_through = Some(sequence_id);
             state.next_automatic = sequence_id.checked_add(1);
-            if state.retired.remove(&sequence_id) {
+            let retired_range = state
+                .retired
+                .range(..=sequence_id)
+                .next_back()
+                .map(|(&start, &end)| (start, end));
+            if let Some((start, end)) = retired_range.filter(|&(_, end)| sequence_id <= end) {
+                state.automatic_used_through = Some(end);
+                state.next_automatic = end.checked_add(1);
+                state.retired.remove(&start);
+                if start < state.automatic_start {
+                    // 0/1 不在自动前缀内；manual wrapping batch 可能把它们与
+                    // 自动区间合并，跳过时只能清掉 [automatic_start, end]。
+                    let manual_prefix_end = state.automatic_start - 1;
+                    state.retired.insert(start, manual_prefix_end);
+                }
                 continue;
             }
             if state.reserved.insert(sequence_id) {
@@ -376,7 +397,7 @@ impl SequenceRegistry {
                 .automatic_used_through
                 .is_some_and(|used_through| *id >= state.automatic_start && *id <= used_through)
                 || state.reserved.contains(id)
-                || state.retired.contains(id)
+                || retired_sequence_contains(&state.retired, *id)
         }) {
             return None;
         }
@@ -412,17 +433,67 @@ impl SequenceRegistry {
             state.reserved.remove(&sequence_id);
             return true;
         }
-        if state.retired.contains(&sequence_id) {
+        if retired_sequence_contains(&state.retired, sequence_id) {
             state.reserved.remove(&sequence_id);
             return true;
         }
-        if state.retired.len() >= MAX_RETIRED_SEQUENCE_IDS {
+        if !insert_retired_sequence(&mut state.retired, sequence_id) {
             return false;
         }
         state.reserved.remove(&sequence_id);
-        state.retired.insert(sequence_id);
         true
     }
+}
+
+fn retired_sequence_contains(retired: &BTreeMap<u32, u32>, sequence_id: u32) -> bool {
+    retired
+        .range(..=sequence_id)
+        .next_back()
+        .is_some_and(|(_, &end)| sequence_id <= end)
+}
+
+/// 插入一个未存在的 sequence，并尽可能与相邻区间合并。返回 false 表示已经达到
+/// 不相交区间上限；此时调用方必须保留 reserved，随后关闭 connection，避免复用窗口。
+fn insert_retired_sequence(retired: &mut BTreeMap<u32, u32>, sequence_id: u32) -> bool {
+    let previous = retired
+        .range(..=sequence_id)
+        .next_back()
+        .map(|(&start, &end)| (start, end));
+    let next = retired
+        .range(sequence_id..)
+        .next()
+        .map(|(&start, &end)| (start, end));
+    let joins_previous = previous.is_some_and(|(_, end)| end.checked_add(1) == Some(sequence_id));
+    let joins_next = next.is_some_and(|(start, _)| sequence_id.checked_add(1) == Some(start));
+
+    match (joins_previous, joins_next) {
+        (true, true) => {
+            let (previous_start, _) = previous.expect("joins_previous implies previous");
+            let (next_start, next_end) = next.expect("joins_next implies next");
+            if let Some(previous_end) = retired.get_mut(&previous_start) {
+                *previous_end = next_end;
+            }
+            retired.remove(&next_start);
+        }
+        (true, false) => {
+            let (previous_start, _) = previous.expect("joins_previous implies previous");
+            if let Some(previous_end) = retired.get_mut(&previous_start) {
+                *previous_end = sequence_id;
+            }
+        }
+        (false, true) => {
+            let (next_start, next_end) = next.expect("joins_next implies next");
+            retired.remove(&next_start);
+            retired.insert(sequence_id, next_end);
+        }
+        (false, false) => {
+            if retired.len() >= MAX_RETIRED_SEQUENCE_RANGES {
+                return false;
+            }
+            retired.insert(sequence_id, sequence_id);
+        }
+    }
+    true
 }
 
 struct SequenceLease {
@@ -651,6 +722,8 @@ struct Inner {
     event_depth: Arc<AtomicUsize>,
     event_tickets: Arc<EventTicketTracker>,
     event_overflowed: AtomicBool,
+    unexpected_pdu_log_at: AtomicU64,
+    unexpected_pdu_suppressed: AtomicUsize,
     terminal_reason: StdMutex<Option<Error>>,
     pending_submits: RwLock<HashMap<u32, PendingSubmit>>,
     window_semaphore: Arc<Semaphore>,
@@ -955,7 +1028,7 @@ impl Inner {
 
     fn start_event_overload_close(self: &Arc<Self>) {
         log::error!(
-            "CMPP event backlog 已达到上限 {}，正在有界关闭 connection",
+            "CMPP event backlog/backpressure 已达到上限 {}，正在有界关闭 connection",
             EVENT_SPOOL_NORMAL_CAPACITY
         );
         if !self.begin_closing(false) {
@@ -972,6 +1045,23 @@ impl Inner {
         } else {
             self.runtime_handle.spawn(close_task);
         }
+    }
+
+    fn start_event_dispatch_backpressure_close(self: &Arc<Self>) {
+        self.event_overflowed.store(true, Ordering::Release);
+        {
+            let mut admission = self
+                .event_admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if matches!(
+                *admission,
+                EventAdmissionState::Open | EventAdmissionState::Draining
+            ) {
+                *admission = EventAdmissionState::Overflowed;
+            }
+        }
+        self.start_event_overload_close();
     }
 
     fn close_event_spool(&self) {
@@ -1251,6 +1341,8 @@ impl CmppConnection {
             event_depth,
             event_tickets,
             event_overflowed: AtomicBool::new(false),
+            unexpected_pdu_log_at: AtomicU64::new(u64::MAX),
+            unexpected_pdu_suppressed: AtomicUsize::new(0),
             terminal_reason: StdMutex::new(None),
             pending_submits: RwLock::new(HashMap::with_capacity(window_size)),
             window_semaphore: Arc::new(Semaphore::new(window_size)),
@@ -1280,7 +1372,16 @@ impl CmppConnection {
             submit_retry_batch_size,
         });
 
-        let dispatcher_handle = tokio::spawn(event_dispatcher_task(event_spool_rx, events_tx));
+        let framed_parts = framed.into_parts();
+        let reader_io = framed_parts.io;
+        let reader_codec = framed_parts.codec;
+        let reader_buf = framed_parts.read_buf;
+
+        let dispatcher_handle = tokio::spawn(event_dispatcher_task(
+            event_spool_rx,
+            events_tx,
+            Arc::downgrade(&inner),
+        ));
         drop(dispatcher_handle);
 
         let writer = spawn_worker(
@@ -1297,7 +1398,9 @@ impl CmppConnection {
             inner.clone(),
             reader_task(
                 inner.clone(),
-                framed,
+                reader_io,
+                reader_codec,
+                reader_buf,
                 Duration::from_secs(params.read_idle_timeout),
                 inner.phase_tx.subscribe(),
             ),
@@ -1351,31 +1454,11 @@ impl CmppConnection {
             return Err(Error::Closed);
         }
 
-        let mut submits = options.try_build_submits(content)?;
-        let udh_reference_lease = if submits.len() > 1 {
-            let preferred = submits
-                .first()
-                .and_then(|submit| submit.msg_content.get(3))
-                .copied()
-                .ok_or_else(|| Error::Config("long SMS UDH 无效".to_string()))?;
-            let bucket_ids =
-                UDH_REFERENCE_POOL.bucket_ids(&options.src_id, &options.dest_terminal_ids);
-            let lease = UDH_REFERENCE_POOL
-                .try_acquire(bucket_ids, preferred, self.inner.udh_reference_cooldown)
-                .ok_or_else(|| {
-                    Error::Config("同一短信重组域的 8-bit UDH reference 已全部占用".to_string())
-                })?;
-            for submit in &mut submits {
-                let Some(reference) = submit.msg_content.get_mut(3) else {
-                    return Err(Error::Config("long SMS UDH 无效".to_string()));
-                };
-                *reference = lease.reference();
-            }
-            Some(lease)
-        } else {
-            None
-        };
-        let mut seq_ids = Vec::with_capacity(submits.len());
+        if options.dest_terminal_ids.len() > u8::MAX as usize {
+            return Err(Error::Config("SUBMIT destination 数量超过 255".to_string()));
+        }
+        let plan = prepare_submit_content(content)?;
+        let segment_count = plan.segment_count();
         let mut phase_rx = self.inner.phase_tx.subscribe();
         let _manual_batch_permit = if base_sequence_id.is_some() {
             Some(tokio::select! {
@@ -1388,11 +1471,28 @@ impl CmppConnection {
         } else {
             None
         };
+
+        let udh_reference_lease = if segment_count > 1 {
+            let preferred = plan
+                .preferred_ref()
+                .ok_or_else(|| Error::Config("long SMS UDH 无效".to_string()))?;
+            let bucket_ids =
+                UDH_REFERENCE_POOL.bucket_ids(&options.src_id, &options.dest_terminal_ids);
+            let lease = UDH_REFERENCE_POOL
+                .try_acquire(bucket_ids, preferred, self.inner.udh_reference_cooldown)
+                .ok_or_else(|| {
+                    Error::Config("同一短信重组域的 8-bit UDH reference 已全部占用".to_string())
+                })?;
+            Some(lease)
+        } else {
+            None
+        };
+        let mut seq_ids = Vec::with_capacity(segment_count);
         let mut manual_sequence_leases = if let Some(base) = base_sequence_id {
             Some(
                 self.inner
                     .sequence_registry
-                    .reserve_batch(base, submits.len())
+                    .reserve_batch(base, segment_count)
                     .ok_or_else(|| {
                         Error::Config(
                             "base_sequence_id 区间超过 255 段、包含重复值或已被当前 connection 使用"
@@ -1405,13 +1505,20 @@ impl CmppConnection {
             None
         };
 
-        for submit in submits {
+        for index in 0..segment_count {
             let sequence_lease = match manual_sequence_leases.as_mut() {
                 Some(leases) => Some(leases.next().ok_or(Error::ChannelClosed)?),
                 None => None,
             };
             let sequence_id = self
-                .send_submit(sequence_lease, submit, udh_reference_lease.clone())
+                .send_submit(
+                    sequence_lease,
+                    options,
+                    &plan,
+                    index,
+                    udh_reference_lease.as_ref().map(|lease| lease.reference()),
+                    udh_reference_lease.clone(),
+                )
                 .await?;
             seq_ids.push(sequence_id);
         }
@@ -1422,7 +1529,10 @@ impl CmppConnection {
     async fn send_submit(
         &self,
         sequence_lease: Option<SequenceLease>,
-        submit: Submit,
+        options: &SubmitOptions,
+        plan: &SubmitContentPlan<'_>,
+        segment_index: usize,
+        udh_reference: Option<u8>,
         udh_reference_lease: Option<Arc<UdhReferenceLease>>,
     ) -> Result<u32> {
         let mut phase_rx = self.inner.phase_tx.subscribe();
@@ -1434,6 +1544,8 @@ impl CmppConnection {
             }
         };
 
+        let segment = plan.segment(segment_index, udh_reference)?;
+        let submit = options.build_submit_from_segment(segment);
         let mut sequence_lease = match sequence_lease {
             Some(lease) => lease,
             None => match self.inner.sequence_registry.reserve_next() {
@@ -1837,6 +1949,7 @@ async fn send_until_closed(
 async fn event_dispatcher_task(
     mut event_spool_rx: mpsc::Receiver<EventSpoolItem>,
     events_tx: mpsc::Sender<Event>,
+    inner: Weak<Inner>,
 ) {
     let mut discard_events = false;
 
@@ -1853,25 +1966,66 @@ async fn event_dispatcher_task(
                     Ok(event) => event,
                     Err(_) => continue,
                 };
-                if !discard_events && events_tx.send(event).await.is_err() {
-                    discard_events = true;
-                    log::debug!("event receiver 已丢弃；后续 event 将被有界排空");
+                if !discard_events {
+                    if let Err(error) = dispatch_event_with_budget(&events_tx, event).await {
+                        discard_events = true;
+                        match error {
+                            EventDispatchError::Backpressure => {
+                                log::warn!(
+                                    "event receiver 背压超过 {:?}，正在关闭 connection 并有界排空",
+                                    EVENT_DISPATCH_BACKPRESSURE_TIMEOUT
+                                );
+                                if let Some(inner) = inner.upgrade() {
+                                    inner.start_event_dispatch_backpressure_close();
+                                }
+                            }
+                            EventDispatchError::Closed => {
+                                log::debug!("event receiver 已丢弃；后续 event 将被有界排空");
+                            }
+                        }
+                    }
                 }
             }
             EventSpoolItem::Terminal {
                 reason,
                 _depth_permit,
             } => {
-                if let Some(reason) = reason
-                    && !discard_events
-                {
-                    let _ = events_tx.send(Event::Disconnected(reason)).await;
+                if let Some(reason) = reason {
+                    // 普通 event 始终通过 reserve_many(2) 发送，刻意保留一个
+                    // slot 给终态，避免消费者暂时不读时 TERMINAL 永远排不到。
+                    let _ = events_tx.try_send(Event::Disconnected(reason));
                 }
                 break;
             }
         }
     }
     log::debug!("event dispatcher task 已退出");
+}
+
+enum EventDispatchError {
+    Closed,
+    Backpressure,
+}
+
+/// 向公开 event channel 发送普通事件，同时保留一个容量槽给 Disconnected。
+///
+/// `event_spool` 本身已经有界；这里再给消费者背压设置有限等待，避免 dispatcher
+/// 在消费者永久不读取时占住一个 task。超时后调用方进入 discard 模式并继续排空
+/// spool，终态仍可利用预留槽发送。
+async fn dispatch_event_with_budget(
+    events_tx: &mpsc::Sender<Event>,
+    event: Event,
+) -> std::result::Result<(), EventDispatchError> {
+    let mut permits = tokio::time::timeout(
+        EVENT_DISPATCH_BACKPRESSURE_TIMEOUT,
+        events_tx.reserve_many(2),
+    )
+    .await
+    .map_err(|_| EventDispatchError::Backpressure)?
+    .map_err(|_| EventDispatchError::Closed)?;
+    let permit = permits.next().ok_or(EventDispatchError::Closed)?;
+    permit.send(event);
+    Ok(())
 }
 
 async fn writer_task(
@@ -2063,7 +2217,9 @@ async fn writer_task(
 /// 读取 frame，分发为 event，并自动回复 liveness/teardown PDU。
 async fn reader_task(
     inner: Arc<Inner>,
-    mut framed: FramedRead<OwnedReadHalf, CmppFrameCodec>,
+    mut reader: OwnedReadHalf,
+    mut codec: CmppFrameCodec,
+    mut read_buf: BytesMut,
     read_idle: Duration,
     mut phase_rx: watch::Receiver<ConnectionPhase>,
 ) {
@@ -2071,11 +2227,14 @@ async fn reader_task(
         let frame = tokio::select! {
             biased;
             _ = wait_until_closed(&mut phase_rx) => return,
-            res = tokio::time::timeout(read_idle, framed.next()) => match res {
-                Ok(Some(Ok(frame))) => frame,
-                Ok(Some(Err(e))) => { log::warn!("CMPP decode 错误: {}", e); break e; }
+            res = read_frame_with_idle(&mut reader, &mut codec, &mut read_buf, read_idle) => match res {
+                Ok(Some(frame)) => frame,
                 Ok(None) => { log::info!("CMPP connection 已由 peer 关闭"); break Error::Closed; }
-                Err(_) => { log::warn!("CMPP read idle timeout（{}s）", read_idle.as_secs()); break Error::Timeout; }
+                Err(Error::Timeout) => {
+                    log::warn!("CMPP read idle timeout（{}s）", read_idle.as_secs());
+                    break Error::Timeout;
+                }
+                Err(e) => { log::warn!("CMPP decode/读取错误: {}", e); break e; }
             }
         };
 
@@ -2232,13 +2391,46 @@ async fn reader_task(
                 }
             }
             other => {
-                log::warn!("收到非预期入站 PDU: {:#010x}", other.command_id());
+                if let Some(suppressed) = take_unexpected_pdu_log_slot(&inner) {
+                    log::warn!(
+                        "收到非预期入站 PDU: {:#010x}（自上次警告以来抑制 {} 条）",
+                        other.command_id(),
+                        suppressed
+                    );
+                }
             }
         }
     };
 
     inner.finish(Some(reason));
     log::debug!("reader task 已退出");
+}
+
+/// 以“字节间 idle”而非“整帧完成期限”读取一个 CMPP frame。
+///
+/// codec 先消费 handshake 阶段可能已经 read-ahead 的 buffer；只有在 buffer
+/// 仍不足以组成完整 frame 时才等待 socket。每次成功读到字节都会重新开始
+/// `read_idle`，慢速但持续传输不会被误判为空闲连接。
+async fn read_frame_with_idle(
+    reader: &mut OwnedReadHalf,
+    codec: &mut CmppFrameCodec,
+    read_buf: &mut BytesMut,
+    read_idle: Duration,
+) -> Result<Option<Frame>> {
+    loop {
+        if let Some(frame) = codec.decode(read_buf)? {
+            return Ok(Some(frame));
+        }
+        let bytes_read = tokio::time::timeout(read_idle, reader.read_buf(read_buf))
+            .await
+            .map_err(|_| Error::Timeout)??;
+        if bytes_read == 0 {
+            // 保持 FramedRead 的 EOF 语义：若 buffer 中还有不完整的 CMPP
+            // frame，decode_eof 会返回“bytes remaining”错误，而不是把截断帧
+            // 当作正常 peer close。
+            return codec.decode_eof(read_buf);
+        }
+    }
 }
 
 /// 在没有未完成 heartbeat 时周期性发送 ACTIVE_TEST。
@@ -2315,7 +2507,9 @@ async fn timeout_task(inner: Arc<Inner>, mut phase_rx: watch::Receiver<Connectio
     let retry_count = inner.retry_count;
     let active_check_interval =
         (timeout / MAX_SUBMIT_RETRY_SPREAD_TICKS as u32).min(TIMEOUT_CHECK_INTERVAL);
-    let mut ticker = tokio::time::interval(active_check_interval);
+    let jitter = timeout_scan_jitter(active_check_interval);
+    let mut ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + jitter, active_check_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut expired_submits: Vec<(Instant, SubmitAttemptKey)> =
         Vec::with_capacity(inner.window_size);
@@ -2550,6 +2744,44 @@ async fn timeout_task(inner: Arc<Inner>, mut phase_rx: watch::Receiver<Connectio
         ticker.reset_after(active_check_interval);
     }
     log::debug!("timeout task 已退出");
+}
+
+/// 为每条 connection 的 timeout 扫描分配稳定但轻量的相位偏移，避免大量连接在
+/// 同一秒同时扫描 pending map。偏移小于一个扫描周期，不改变“最多延迟一个 tick”
+/// 的既有超时语义；不引入随机数依赖，也不跨 await 持有共享锁。
+fn timeout_scan_jitter(interval: Duration) -> Duration {
+    let interval_nanos = interval.as_nanos();
+    if interval_nanos == 0 {
+        return Duration::ZERO;
+    }
+    let slot = TIMEOUT_JITTER_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let jitter_nanos = (u128::from(slot) % interval_nanos) as u64;
+    Duration::from_nanos(jitter_nanos)
+}
+
+/// 为异常入站 PDU 提供按 connection 的时间窗限频，避免网关重传/错误流量把日志
+/// I/O 放大成新的背压；返回值是本窗口内被抑制的条数。
+fn take_unexpected_pdu_log_slot(inner: &Inner) -> Option<usize> {
+    let now_millis = LOG_MONOTONIC_EPOCH.elapsed().as_millis() as u64;
+    let interval_millis = UNEXPECTED_PDU_LOG_INTERVAL.as_millis() as u64;
+    loop {
+        let last = inner.unexpected_pdu_log_at.load(Ordering::Relaxed);
+        if last != u64::MAX && now_millis.saturating_sub(last) < interval_millis {
+            inner
+                .unexpected_pdu_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if inner
+            .unexpected_pdu_log_at
+            .compare_exchange(last, now_millis, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(inner.unexpected_pdu_suppressed.swap(0, Ordering::Relaxed));
+        }
+    }
 }
 
 fn log_submit_timeout_batch(count: usize, samples: &[u32]) {

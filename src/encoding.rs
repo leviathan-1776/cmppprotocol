@@ -6,6 +6,7 @@
 
 use crate::error::{Error, Result};
 use encoding_rs::GBK;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// CMPP Msg_Fmt：ASCII（每个字符单 byte）
@@ -63,6 +64,140 @@ pub struct SmsSegment {
     pub pk_number: u8,
     /// 完整 Msg_Content bytes；multipart 时包含 6-byte UDH。
     pub content: Vec<u8>,
+}
+
+/// 仅保留原始内容和分段边界的轻量发送计划。
+///
+/// 连接发送路径使用它在窗口准入后才构造当前 segment，避免在
+/// 大量并发调用时为所有未准入请求保留完整的 UDH 和 PDU 缓冲。
+pub(crate) struct SubmitContentPlan<'a> {
+    content: &'a str,
+    encoding: SmsEncoding,
+    ranges: Vec<Range<usize>>,
+    preferred_ref: Option<u8>,
+}
+
+impl<'a> SubmitContentPlan<'a> {
+    pub(crate) fn segment_count(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub(crate) fn preferred_ref(&self) -> Option<u8> {
+        self.preferred_ref
+    }
+
+    pub(crate) fn segment(&self, index: usize, reference: Option<u8>) -> Result<SmsSegment> {
+        let range = self
+            .ranges
+            .get(index)
+            .ok_or_else(|| Error::Config("SMS segment 序号越界".to_string()))?;
+        let encoded = encode_content(&self.content[range.clone()], self.encoding);
+        if self.ranges.len() == 1 {
+            return Ok(SmsSegment {
+                msg_fmt: self.encoding.msg_fmt(),
+                tp_udhi: 0,
+                pk_total: 1,
+                pk_number: 1,
+                content: encoded,
+            });
+        }
+
+        let total = u8::try_from(self.ranges.len())
+            .map_err(|_| Error::Config("long SMS segment 数量超过 255".to_string()))?;
+        let seq = u8::try_from(index + 1)
+            .map_err(|_| Error::Config("long SMS segment 序号超过 255".to_string()))?;
+        let reference = reference
+            .or(self.preferred_ref)
+            .ok_or_else(|| Error::Config("long SMS 缺少 UDH reference".to_string()))?;
+        let mut body = Vec::with_capacity(6 + encoded.len());
+        body.extend_from_slice(&[0x05, 0x00, 0x03, reference, total, seq]);
+        body.extend_from_slice(&encoded);
+        Ok(SmsSegment {
+            msg_fmt: self.encoding.msg_fmt(),
+            tp_udhi: 1,
+            pk_total: total,
+            pk_number: seq,
+            content: body,
+        })
+    }
+}
+
+/// 预计划 SUBMIT 内容，不创建所有分段的编码缓冲。
+pub(crate) fn prepare_submit_content(content: &str) -> Result<SubmitContentPlan<'_>> {
+    let encoding = choose_encoding(content);
+    let total_bytes = match encoding {
+        SmsEncoding::Ascii => content.len(),
+        SmsEncoding::Ucs2 => content
+            .chars()
+            .map(|character| character.len_utf16() * 2)
+            .sum(),
+        SmsEncoding::Gbk => unreachable!("choose_encoding 不会选择 GBK"),
+    };
+
+    let segment_count = if total_bytes <= SINGLE_MAX_BYTES {
+        1
+    } else {
+        match encoding {
+            SmsEncoding::Ascii => total_bytes.div_ceil(MULTIPART_MAX_BYTES),
+            SmsEncoding::Ucs2 => {
+                let mut count = 1usize;
+                let mut current_bytes = 0usize;
+                for character in content.chars() {
+                    let encoded_len = character.len_utf16() * 2;
+                    if current_bytes != 0 && current_bytes + encoded_len > MULTIPART_MAX_BYTES {
+                        count += 1;
+                        current_bytes = 0;
+                    }
+                    current_bytes += encoded_len;
+                }
+                count
+            }
+            SmsEncoding::Gbk => unreachable!("choose_encoding 不会选择 GBK"),
+        }
+    };
+    if segment_count > u8::MAX as usize {
+        return Err(Error::Config("long SMS segment 数量超过 255".to_string()));
+    }
+
+    let ranges = if total_bytes <= SINGLE_MAX_BYTES {
+        std::iter::once(0..content.len()).collect()
+    } else {
+        let mut ranges = Vec::with_capacity(segment_count);
+        match encoding {
+            SmsEncoding::Ascii => {
+                let mut start = 0usize;
+                for chunk in content.as_bytes().chunks(MULTIPART_MAX_BYTES) {
+                    ranges.push(start..start + chunk.len());
+                    start += chunk.len();
+                }
+            }
+            SmsEncoding::Ucs2 => {
+                let mut start = 0usize;
+                let mut current_bytes = 0usize;
+                for (offset, character) in content.char_indices() {
+                    let encoded_len = character.len_utf16() * 2;
+                    if current_bytes != 0 && current_bytes + encoded_len > MULTIPART_MAX_BYTES {
+                        ranges.push(start..offset);
+                        start = offset;
+                        current_bytes = 0;
+                    }
+                    current_bytes += encoded_len;
+                }
+                ranges.push(start..content.len());
+            }
+            SmsEncoding::Gbk => unreachable!("choose_encoding 不会选择 GBK"),
+        }
+        ranges
+    };
+
+    let preferred_ref =
+        (ranges.len() > 1).then(|| (UDH_REF_COUNTER.fetch_add(1, Ordering::Relaxed) & 0xFF) as u8);
+    Ok(SubmitContentPlan {
+        content,
+        encoding,
+        ranges,
+        preferred_ref,
+    })
 }
 
 /// 为内容选择 charset：纯 ASCII 使用 single-byte ASCII（fmt=0），其他内容使用
@@ -131,76 +266,11 @@ pub fn decode_msg_content(msg_fmt: u8, tp_udhi: u8, content: &[u8]) -> String {
 /// 内容需要超过 255 个 segment 时返回 [`Error::Config`]；CMPP 2.0 的
 /// `Pk_total`/UDH total 字段都无法表示更大的值。
 pub fn try_split_content(content: &str) -> Result<Vec<SmsSegment>> {
-    let enc = choose_encoding(content);
-    let msg_fmt = enc.msg_fmt();
-
-    let (total_bytes, multipart_segments) = encoded_size_and_segment_count(content, enc)?;
-
-    if total_bytes <= SINGLE_MAX_BYTES {
-        return Ok(vec![SmsSegment {
-            msg_fmt,
-            tp_udhi: 0,
-            pk_total: 1,
-            pk_number: 1,
-            content: encode_content(content, enc),
-        }]);
-    }
-
-    // 贪心地将完整字符打包成不超过 MULTIPART_MAX_BYTES 的 chunks。
-    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(multipart_segments);
-    match enc {
-        SmsEncoding::Ascii => {
-            chunks.extend(
-                content
-                    .as_bytes()
-                    .chunks(MULTIPART_MAX_BYTES)
-                    .map(<[u8]>::to_vec),
-            );
-        }
-        SmsEncoding::Ucs2 => {
-            let mut current = Vec::with_capacity(MULTIPART_MAX_BYTES);
-            for character in content.chars() {
-                let mut utf16 = [0u16; 2];
-                let units = character.encode_utf16(&mut utf16);
-                let encoded_len = units.len() * 2;
-                if !current.is_empty() && current.len() + encoded_len > MULTIPART_MAX_BYTES {
-                    chunks.push(std::mem::replace(
-                        &mut current,
-                        Vec::with_capacity(MULTIPART_MAX_BYTES),
-                    ));
-                }
-                for unit in units {
-                    current.extend_from_slice(&unit.to_be_bytes());
-                }
-            }
-            if !current.is_empty() {
-                chunks.push(current);
-            }
-        }
-        SmsEncoding::Gbk => unreachable!("choose_encoding 不会选择 GBK"),
-    }
-
-    let total = u8::try_from(chunks.len()).expect("分段数已在拆分前校验");
-    let ref_num = (UDH_REF_COUNTER.fetch_add(1, Ordering::Relaxed) & 0xFF) as u8;
-
-    Ok(chunks
-        .into_iter()
-        .enumerate()
-        .map(|(i, chunk)| {
-            let seq = u8::try_from(i + 1).expect("分段序号已在拆分前校验");
-            let mut body = Vec::with_capacity(6 + chunk.len());
-            // UDH：total length=5，IEI=0x00（concat，8-bit ref），IEDL=3，ref，total，seq。
-            body.extend_from_slice(&[0x05, 0x00, 0x03, ref_num, total, seq]);
-            body.extend_from_slice(&chunk);
-            SmsSegment {
-                msg_fmt,
-                tp_udhi: 1,
-                pk_total: total,
-                pk_number: seq,
-                content: body,
-            }
-        })
-        .collect())
+    let plan = prepare_submit_content(content)?;
+    let reference = plan.preferred_ref();
+    (0..plan.segment_count())
+        .map(|index| plan.segment(index, reference))
+        .collect()
 }
 
 /// 将内容拆分为一个或多个 SMS segment。
@@ -211,42 +281,6 @@ pub fn try_split_content(content: &str) -> Result<Vec<SmsSegment>> {
 /// [`try_split_content`]。
 pub fn split_content(content: &str) -> Vec<SmsSegment> {
     try_split_content(content).expect("内容无法拆分为合法的 CMPP 2.0 SUBMIT segment")
-}
-
-fn encoded_size_and_segment_count(content: &str, enc: SmsEncoding) -> Result<(usize, usize)> {
-    match enc {
-        SmsEncoding::Ascii => {
-            let total_bytes = content.len();
-            let segments = total_bytes.div_ceil(MULTIPART_MAX_BYTES).max(1);
-            if total_bytes > SINGLE_MAX_BYTES && segments > u8::MAX as usize {
-                return Err(Error::Config("long SMS segment 数量超过 255".to_string()));
-            }
-            Ok((total_bytes, segments))
-        }
-        SmsEncoding::Ucs2 => {
-            let mut total_bytes = 0usize;
-            let mut current_segment_bytes = 0usize;
-            let mut segments = 1usize;
-
-            for character in content.chars() {
-                let encoded_len = character.len_utf16() * 2;
-                total_bytes = total_bytes.saturating_add(encoded_len);
-                if current_segment_bytes != 0
-                    && current_segment_bytes + encoded_len > MULTIPART_MAX_BYTES
-                {
-                    segments += 1;
-                    if segments > u8::MAX as usize {
-                        return Err(Error::Config("long SMS segment 数量超过 255".to_string()));
-                    }
-                    current_segment_bytes = 0;
-                }
-                current_segment_bytes += encoded_len;
-            }
-
-            Ok((total_bytes, segments))
-        }
-        SmsEncoding::Gbk => unreachable!("choose_encoding 不会选择 GBK"),
-    }
 }
 
 #[cfg(test)]

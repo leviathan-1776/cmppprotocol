@@ -4,7 +4,7 @@
 //! 它会为每个 SMS segment 生成一个 [`Submit`]（long message 通过
 //! [`crate::encoding::split_content`] 按 6-byte UDH 拆分）。
 
-use crate::encoding::try_split_content;
+use crate::encoding::{SmsSegment, try_split_content};
 use crate::error::{Error, Result};
 use crate::pdu::Submit;
 
@@ -125,28 +125,32 @@ impl SubmitOptions {
 
         Ok(try_split_content(content)?
             .into_iter()
-            .map(|seg| Submit {
-                msg_id: [0u8; 8],
-                pk_total: seg.pk_total,
-                pk_number: seg.pk_number,
-                registered_delivery: self.registered_delivery,
-                msg_level: self.msg_level,
-                service_id: self.service_id.clone(),
-                fee_user_type: self.fee_user_type,
-                fee_terminal_id: self.fee_terminal_id.clone(),
-                tp_pid: self.tp_pid,
-                tp_udhi: seg.tp_udhi,
-                msg_fmt: seg.msg_fmt,
-                msg_src: self.msg_src.clone(),
-                fee_type: self.fee_type.clone(),
-                fee_code: self.fee_code.clone(),
-                valid_time: self.valid_time.clone(),
-                at_time: self.at_time.clone(),
-                src_id: self.src_id.clone(),
-                dest_terminal_ids: self.dest_terminal_ids.clone(),
-                msg_content: seg.content,
-            })
+            .map(|seg| self.build_submit_from_segment(seg))
             .collect())
+    }
+
+    pub(crate) fn build_submit_from_segment(&self, seg: SmsSegment) -> Submit {
+        Submit {
+            msg_id: [0u8; 8],
+            pk_total: seg.pk_total,
+            pk_number: seg.pk_number,
+            registered_delivery: self.registered_delivery,
+            msg_level: self.msg_level,
+            service_id: self.service_id.clone(),
+            fee_user_type: self.fee_user_type,
+            fee_terminal_id: self.fee_terminal_id.clone(),
+            tp_pid: self.tp_pid,
+            tp_udhi: seg.tp_udhi,
+            msg_fmt: seg.msg_fmt,
+            msg_src: self.msg_src.clone(),
+            fee_type: self.fee_type.clone(),
+            fee_code: self.fee_code.clone(),
+            valid_time: self.valid_time.clone(),
+            at_time: self.at_time.clone(),
+            src_id: self.src_id.clone(),
+            dest_terminal_ids: self.dest_terminal_ids.clone(),
+            msg_content: seg.content,
+        }
     }
 
     /// 构造恰好一个 non-concatenated SUBMIT PDU。
