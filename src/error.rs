@@ -46,6 +46,18 @@ pub enum Error {
     #[error("由 peer 终止")]
     Terminated,
 
+    /// 连接在 submit 过程中关闭：`sequence_ids` 中的 segment 已入队并会各自
+    /// 收到终态事件（`SubmitResp`/`SubmitTimeout`/`SubmitDropped`），其余
+    /// segment 未能入队；`source` 为导致中断的底层错误。
+    #[error("连接关闭，已有 {} 个 segment 入队", .sequence_ids.len())]
+    PartialSubmit {
+        /// 已成功入队的 segment sequence id。
+        sequence_ids: Vec<u32>,
+        /// 导致中断的底层错误。
+        #[source]
+        source: Box<Error>,
+    },
+
     /// 调用方提供了无效配置。
     #[error("config 无效: {0}")]
     Config(String),

@@ -8,6 +8,20 @@ use crate::encoding::{SmsSegment, try_split_content};
 use crate::error::{Error, Result};
 use crate::pdu::Submit;
 
+impl Submit {
+    /// 用 segment 的 per-segment 字段覆盖当前值（content move，不重新分配）。
+    ///
+    /// 供连接发送热路径复用 [`SubmitOptions::build_submit_template`] 中已 clone
+    /// 一次的共享字段，避免长短信每个 segment 重复 clone 十余个字符串。
+    pub(crate) fn apply_segment(&mut self, segment: SmsSegment) {
+        self.pk_total = segment.pk_total;
+        self.pk_number = segment.pk_number;
+        self.tp_udhi = segment.tp_udhi;
+        self.msg_fmt = segment.msg_fmt;
+        self.msg_content = segment.content;
+    }
+}
+
 /// 待提交 message 每个 segment 共享的可配置字段。
 ///
 /// 每个 segment 独有的字段（`msg_fmt`、`tp_udhi`、`pk_total`、`pk_number`、
@@ -130,18 +144,29 @@ impl SubmitOptions {
     }
 
     pub(crate) fn build_submit_from_segment(&self, seg: SmsSegment) -> Submit {
+        let mut submit = self.build_submit_template();
+        submit.apply_segment(seg);
+        submit
+    }
+
+    /// 构建模板 Submit：共享字段 clone 一次，随后逐段用
+    /// [`Submit::apply_segment`] 覆盖 per-segment 字段。
+    ///
+    /// 连接发送热路径用它在多 segment 长短信间复用同一份共享字段，
+    /// 避免每个 segment 重复 clone `service_id`/`src_id`/destinations 等十余个字符串。
+    pub(crate) fn build_submit_template(&self) -> Submit {
         Submit {
             msg_id: [0u8; 8],
-            pk_total: seg.pk_total,
-            pk_number: seg.pk_number,
+            pk_total: 1,
+            pk_number: 1,
             registered_delivery: self.registered_delivery,
             msg_level: self.msg_level,
             service_id: self.service_id.clone(),
             fee_user_type: self.fee_user_type,
             fee_terminal_id: self.fee_terminal_id.clone(),
             tp_pid: self.tp_pid,
-            tp_udhi: seg.tp_udhi,
-            msg_fmt: seg.msg_fmt,
+            tp_udhi: 0,
+            msg_fmt: 0,
             msg_src: self.msg_src.clone(),
             fee_type: self.fee_type.clone(),
             fee_code: self.fee_code.clone(),
@@ -149,7 +174,7 @@ impl SubmitOptions {
             at_time: self.at_time.clone(),
             src_id: self.src_id.clone(),
             dest_terminal_ids: self.dest_terminal_ids.clone(),
-            msg_content: seg.content,
+            msg_content: Vec::new(),
         }
     }
 

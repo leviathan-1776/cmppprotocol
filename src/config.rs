@@ -1,5 +1,11 @@
 // 配置相关
 
+/// window_size 允许的硬上限。
+pub(crate) const MAX_WINDOW_SIZE: usize = 16384;
+
+/// 超过该窗口大小时 connect 会输出 warning（多数 ISMG 以 256 为常见上限）。
+pub(crate) const WINDOW_SIZE_ADVISORY_MAX: usize = 256;
+
 /// CMPP protocol 参数配置。
 #[derive(Debug, Clone)]
 pub struct CmppProtocolParams {
@@ -9,7 +15,9 @@ pub struct CmppProtocolParams {
     pub response_timeout: u64,
     /// Retry count，推荐值：3（实际会重试 N-1 次，即 2 次）。
     pub retry_count: u32,
-    /// Sliding window size，推荐值：16。
+    /// Sliding window size，推荐值：16。允许配置更大的窗口（受
+    /// [`crate::CmppProtocolParams`] 的硬上限约束），但超过 256 时 connect
+    /// 会输出 warning，提醒确认 ISMG 支持该窗口大小。
     pub window_size: usize,
     /// TCP connection timeout（秒），推荐值：10。
     pub connect_timeout: u64,
@@ -46,8 +54,11 @@ impl CmppProtocolParams {
         if self.retry_count == 0 {
             return Err("retry_count 不能为 0".to_string());
         }
-        if self.window_size == 0 || self.window_size > 256 {
-            return Err("window_size 必须在 1 到 256 之间".to_string());
+        if self.window_size == 0 || self.window_size > MAX_WINDOW_SIZE {
+            return Err(format!(
+                "window_size 必须在 1 到 {} 之间",
+                MAX_WINDOW_SIZE
+            ));
         }
         if self.connect_timeout == 0 {
             return Err("connect_timeout 不能为 0".to_string());

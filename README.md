@@ -12,8 +12,9 @@
   - `connect()` 完成登录 handshake，并在返回前校验 ISMG 的 `AuthenticatorISMG`。
   - `submit()` 是 **non-blocking**：它应用 sliding-window backpressure，并立即返回分片的
   sequence id（符合 CMPP pipeline、async 的特性）。
-  - 所有响应都会以 `Event` 形式从 `take_events()` channel 到达：`SubmitResp`、
-  `SubmitTimeout`、`Deliver`（status reports / MO）和 `Disconnected`。自动重传、
+          - 所有响应都会以 `Event` 形式从 `take_events()` channel 到达：`SubmitResp`、
+  `SubmitTimeout`、`SubmitDropped`（连接在收到响应前拆除）、`Deliver`（status reports / MO）
+  和 `Disconnected`。自动重传、
   ACTIVE_TEST heartbeat 和优雅的 TERMINATE teardown 都在内部处理。
 - **Charset & long SMS** (`encoding`)：支持 ASCII/UCS2 编码和 6-byte UDH 拼接，
 保留字符边界（包括 UTF-16 surrogate 边界）。
@@ -51,6 +52,9 @@ async fn main() -> cmppprotocol::Result<()> {
                     }
                 }
                 Event::SubmitTimeout { sequence_id } => println!("超时 seq={}", sequence_id),
+                Event::SubmitDropped { sequence_id } => {
+                    println!("连接断开，未收到响应 seq={}", sequence_id)
+                }
                 Event::Disconnected(e) => { println!("连接已断开: {}", e); break; }
             }
         }
@@ -67,6 +71,75 @@ async fn main() -> cmppprotocol::Result<()> {
 ```
 
 可运行的 CLI 示例见 `examples/send_sms.rs`。
+
+## 语义保证与运维注意事项
+
+- **终态完备性**：每个被 `submit()` 接受的 sequence id 恰好会收到一个终态事件——
+  `SubmitResp`（收到响应）、`SubmitTimeout`（重试预算耗尽）或 `SubmitDropped`
+  （连接在收到响应前被拆除）。调用方可以据此做精确对账与重发。
+- **Disconnected 事件语义**：调用方主动 `close()` 的优雅关闭以事件通道结束
+  （`recv()` 返回 `None`）表达，不发布 `Disconnected` 事件；`Disconnected`
+  仅在异常拆除（I/O 错误、超时、对端 TERMINATE、事件积压有界关闭）时发布
+  并携带原因。
+- **at-least-once 重传**：`SUBMIT_RESP` 丢失但 ISMG 实际已受理时，同 sequence id
+  的重传可能导致网关侧重复计费/重复下发。业务侧应按 `msg_id` 做幂等。
+- **未确认 DELIVER**：`Event::Deliver` 仅在对应 `DELIVER_RESP` 已完整写到 socket 后
+  才会发布。若连接在确认前异常拆除，该 DELIVER 会被丢弃且不会发布事件——
+  多数 ISMG 会在重连后重推未确认的 DELIVER，依赖此行为的应用无需额外处理，
+  不能依赖的应用应在 `Disconnected` 后自行容忍可能的重复。
+- **长短信部分提交**：多 segment 长短信逐段发送；若中途连接关闭，`submit()`
+  返回 `Error::PartialSubmit` 并携带已入队 segment 的 sequence id（它们会各自
+  收到终态事件），但终端不会重组出完整短信。调用方可据此精确重发缺失部分
+  或整体重发（新连接 + 新 UDH reference）。
+- **事件消费必须常驻且快速**：event channel 的消费者停止读取超过 1 秒会触发
+  有界关闭（`Disconnected(ChannelClosed)`），这是防 OOM 设计。请把事件循环放在
+  独立 task 中持续消费。
+- **运行时 metrics**：`conn.metrics()` 返回 `ConnectionMetrics` 快照
+  （admitted / responses / retries / timeouts / delivers / dropped events /
+  in-flight），适合周期性采集用于监控与容量评估。
+- **窗口大小**：`window_size` 默认 16，硬上限 16384。超过 256 时 `connect()`
+  会输出 warning——多数 ISMG 的单连接窗口上限为 256，请先确认网关配置。
+  单连接吞吐约为 `window_size / RTT`。
+
+## 性能
+
+运行时 metrics（`conn.metrics()`）提供 admitted / responses / retries / timeouts /
+delivers / dropped events / in-flight 计数，适合接入监控系统。
+
+### 微基准
+
+```bash
+cargo bench --bench protocol
+```
+
+覆盖 PDU encode/decode、codec framing 和长短信拆分（参考量级：SUBMIT 编码
+~0.5µs、解码 ~0.4µs、8 段长短信拆分 ~3µs）。
+
+### 端到端压测
+
+`examples/loadtest.rs` 内置进程内 mock ISMG（可配置 RTT），测量稳态吞吐、
+延迟分位与窗口回压：
+
+```bash
+cargo run --release --example loadtest -- duration=6 window=256 delay_ms=50 parallel=8
+# 长短信（8 段）+ 自定义 UDH cooldown：
+cargo run --release --example loadtest -- duration=6 long=1 udh_cooldown_ms=500
+```
+
+实测参考（Windows，单连接）：
+
+| 场景 | 实测吞吐 | 说明 |
+|---|---|---|
+| loopback，RTT≈0，window=256 | ~368k segments/s | 受事件消费管线限制，库零丢弃 |
+| RTT 50ms，window=256 | ~4.1k segments/s | 与 `window/RTT` 模型一致（62.8ms 实测 RTT） |
+| RTT 50ms，window=16 | ~259 segments/s | 同上 |
+| 8 段长短信，cooldown 500ms | ~258 条/s | 受窗口限制；默认 300s cooldown 时为 ~0.85 条/s/目的地 |
+
+**长短信 UDH cooldown 约束**：同一 `(Src_Id, Dest_Terminal_Id)` 重组域只有 256 个
+8-bit reference，释放后默认进入 300s cooldown（防网关/终端错误重组）。对同一
+目的地的高频长短信场景，请通过 `connect_with_udh_reference_cooldown` 调低。
+cooldown 状态不跨进程存活；UDH reference 起点在每次启动时随机化，降低重启后
+与重启前在途分片撞号的概率。
 
 ## 范围
 

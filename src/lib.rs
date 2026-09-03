@@ -43,6 +43,9 @@
 //!                 }
 //!             }
 //!             Event::SubmitTimeout { sequence_id } => println!("超时 seq={}", sequence_id),
+//!             Event::SubmitDropped { sequence_id } => {
+//!                 println!("连接断开，未收到响应 seq={}", sequence_id)
+//!             }
 //!             Event::Disconnected(e) => { println!("连接已断开: {}", e); break; }
 //!         }
 //!     }
@@ -70,7 +73,7 @@ pub mod submit;
 
 pub use codec::CmppFrameCodec;
 pub use config::{CmppConfig, CmppProtocolParams};
-pub use connection::{CmppConnection, Event};
+pub use connection::{CmppConnection, ConnectionMetrics, Event};
 pub use encoding::decode_msg_content;
 pub use error::{Error, Result};
 pub use pdu::{

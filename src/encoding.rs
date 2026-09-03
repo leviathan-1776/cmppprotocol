@@ -7,6 +7,7 @@
 use crate::error::{Error, Result};
 use encoding_rs::GBK;
 use std::ops::Range;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// CMPP Msg_Fmt：ASCII（每个字符单 byte）
@@ -23,7 +24,16 @@ const SINGLE_MAX_BYTES: usize = 140;
 const MULTIPART_MAX_BYTES: usize = 134;
 
 /// 用于关联 concatenated segments 的滚动 reference number。
-static UDH_REF_COUNTER: AtomicU32 = AtomicU32::new(0);
+///
+/// 进程启动时随机化起点：UDH cooldown 状态不跨进程存活，固定起点会让重启后
+/// 早期的长短信以大概率复用重启前仍在途的 reference，导致网关/终端错误重组。
+static UDH_REF_COUNTER: LazyLock<AtomicU32> = LazyLock::new(|| {
+    use std::hash::{BuildHasher, Hasher};
+    let seed = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    AtomicU32::new(seed as u32)
+});
 
 /// 支持的 short message character set。
 ///

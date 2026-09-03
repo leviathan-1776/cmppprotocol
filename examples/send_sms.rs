@@ -53,6 +53,9 @@ async fn main() -> cmppprotocol::Result<()> {
                     Event::SubmitTimeout { sequence_id } => {
                         println!("submit 超时 seq={}", sequence_id)
                     }
+                    Event::SubmitDropped { sequence_id } => {
+                        println!("submit 因连接断开未收到响应 seq={}", sequence_id)
+                    }
                     Event::Deliver(deliver) => match deliver.report() {
                         Some(report) => {
                             println!("status report {} -> {}", report.msg_id_hex(), report.stat)
