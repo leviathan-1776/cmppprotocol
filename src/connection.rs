@@ -52,6 +52,15 @@ const CONTROL_BURST_LIMIT: usize = 16;
 const WRITE_BATCH_MAX_FRAMES: usize = 64;
 const WRITE_BATCH_MAX_BYTES: usize = 64 * 1024;
 const WRITE_BATCH_INITIAL_CAPACITY: usize = 4 * 1024;
+// reader 侧批量匹配 SUBMIT_RESP 的软上限：一次 read syscall 通常带回多个完整
+// 帧，超限即先 flush（单次写锁批量匹配），约束单次锁内工作量与缓冲内存。
+const SUBMIT_RESP_BATCH_MAX: usize = 256;
+// 拆连终态事件（SubmitDropped）每个 spool item 携带的数量上限：window=16384
+// 时也只占 ≤128 个 spool 槽（容量 258），避免挤占留给 Terminal 的 emergency 槽。
+const SUBMIT_DROPPED_BATCH_SIZE: usize = 128;
+// fail_all_pending 对暂满 spool 的退避重试预算：dispatcher 背压后进入 discard
+// 模式会快速排空，预算内重试必然收敛；超预算则放弃并计数（有界内存契约）。
+const TEARDOWN_EVENT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SUBMIT_RETRY_SPREAD_TICKS: usize = 4;
 const MAX_MANUAL_SEQUENCE_BATCHES: usize = 4;
 // 退休集合按区间保存；该上限约束 BTreeMap 节点数，而不是连续区间覆盖的 ID 数量。
@@ -135,6 +144,20 @@ pub struct ConnectionMetrics {
 }
 
 enum EventSpoolItem {
+    /// 立即发布的事件：事件本体直接进 spool，dispatcher 收到即转发，无
+    /// oneshot 中转（SubmitResp / SubmitTimeout / SubmitDropped 等热路径事件）。
+    Direct {
+        event: Event,
+        _depth_permit: EventDepthPermit,
+    },
+    /// 拆连终态事件批量：一个 spool 槽携带多个 SubmitDropped，避免大窗口
+    /// 拆连的事件洪峰挤占 spool 容量（含留给 Terminal 的 emergency 槽）。
+    Batch {
+        events: Vec<Event>,
+        _depth_permit: EventDepthPermit,
+    },
+    /// 延迟发布的事件：事件在后续条件满足（DELIVER_RESP 完整写出）后才通过
+    /// oneshot 发布。
     Event {
         event_rx: oneshot::Receiver<Event>,
         _depth_permit: EventDepthPermit,
@@ -147,18 +170,23 @@ enum EventSpoolItem {
 
 struct EventDepthPermit {
     depth: Arc<AtomicUsize>,
+    count: usize,
 }
 
 impl EventDepthPermit {
     fn new(depth: Arc<AtomicUsize>) -> Self {
-        depth.fetch_add(1, Ordering::SeqCst);
-        EventDepthPermit { depth }
+        Self::new_n(depth, 1)
+    }
+
+    fn new_n(depth: Arc<AtomicUsize>, count: usize) -> Self {
+        depth.fetch_add(count, Ordering::SeqCst);
+        EventDepthPermit { depth, count }
     }
 }
 
 impl Drop for EventDepthPermit {
     fn drop(&mut self) {
-        self.depth.fetch_sub(1, Ordering::SeqCst);
+        self.depth.fetch_sub(self.count, Ordering::SeqCst);
     }
 }
 
@@ -883,9 +911,12 @@ impl Inner {
     /// 拆连时对每个未终结的 sequence 发布 [`Event::SubmitDropped`]，保证调用方
     /// 对每个已被 `submit()` 接受的 sequence id 都能拿到确定终态。这里刻意绕过
     /// event admission 状态机：优雅关闭的 drain 会先 Sealed admission，而此时
-    /// pending SUBMIT 的终态仍必须送达消费者。spool 已满时个别事件会被放弃
-    /// （计入 `events_dropped`），不会无界阻塞清理。
-    fn fail_all_pending(self: &Arc<Self>) {
+    /// pending SUBMIT 的终态仍必须送达消费者。事件按批打包成 spool item
+    /// （每批 [`SUBMIT_DROPPED_BATCH_SIZE`] 个），使 window=16384 的拆连也只占
+    /// ≤128 个 spool 槽，不会挤占留给 Terminal 的 emergency 容量；spool 暂满时
+    /// 做有界退避重试（dispatcher 在背压后会进入 discard 模式快速排空），重试
+    /// 耗尽仍失败的事件计入 `events_dropped` 并输出 warn 日志。
+    async fn fail_all_pending(self: &Arc<Self>) {
         let dropped: Vec<u32> = {
             let mut pending = self.pending_submits.write();
             if pending.is_empty() {
@@ -893,71 +924,164 @@ impl Inner {
             }
             pending.drain().map(|(sequence_id, _)| sequence_id).collect()
         };
-        for sequence_id in dropped {
-            let published = self
-                .make_event_ticket(false)
-                .map(|ticket| ticket.publish(Event::SubmitDropped { sequence_id }))
-                .unwrap_or(false);
-            if !published {
-                self.events_dropped.fetch_add(1, Ordering::Relaxed);
+        let retry_deadline = Instant::now() + TEARDOWN_EVENT_RETRY_BUDGET;
+        let mut backoff = Duration::from_millis(1);
+        for (index, chunk) in dropped.chunks(SUBMIT_DROPPED_BATCH_SIZE).enumerate() {
+            let count = chunk.len();
+            let mut item = EventSpoolItem::Batch {
+                events: chunk
+                    .iter()
+                    .map(|&sequence_id| Event::SubmitDropped { sequence_id })
+                    .collect(),
+                _depth_permit: EventDepthPermit::new_n(self.event_depth.clone(), count),
+            };
+            let mut delivered = false;
+            let mut spool_closed = false;
+            while Instant::now() < retry_deadline {
+                match self.event_spool_tx.try_send(item) {
+                    Ok(()) => {
+                        delivered = true;
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Full(returned)) => {
+                        item = returned;
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_millis(20));
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        spool_closed = true;
+                        break;
+                    }
+                }
+            }
+            if !delivered {
+                self.events_dropped.fetch_add(count as u64, Ordering::Relaxed);
+                if spool_closed {
+                    // dispatcher 已退出，当前及后续批次的终态事件都无法送达。
+                    let remaining: usize = dropped
+                        .chunks(SUBMIT_DROPPED_BATCH_SIZE)
+                        .skip(index + 1)
+                        .map(|c| c.len())
+                        .sum();
+                    self.events_dropped
+                        .fetch_add(remaining as u64, Ordering::Relaxed);
+                    log::warn!(
+                        "event dispatcher 已退出，{} 个 SubmitDropped 终态事件无法送达",
+                        count + remaining
+                    );
+                    return;
+                }
+                log::warn!(
+                    "spool 重试预算耗尽，{} 个 SubmitDropped 终态事件被放弃（计入 events_dropped）",
+                    count
+                );
             }
         }
     }
 
-    /// 领取一个已入队的 SUBMIT attempt。领取后必须完整写完该 frame，避免半包。
-    fn claim_submit_attempt(&self, key: SubmitAttemptKey) -> bool {
-        let mut pending = self.pending_submits.write();
-        let _admission = self
-            .submit_admission
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let phase = self.phase();
-        if phase != ConnectionPhase::Open
-            && !(phase == ConnectionPhase::Closing
-                && self.drain_submits_on_close.load(Ordering::SeqCst))
-        {
-            return false;
+    /// 批量领取批内 SUBMIT attempt：单次 `pending_submits` 写锁 + admission 锁
+    /// 完成整批 Queued→Writing 校验与转移，领取失败的帧从 batch 中原位移除
+    /// （保持顺序）。admission 锁在整批期间持住，而 phase 迁移
+    /// （begin_closing / transition_to_closed）同样需要该锁，因此批内 phase
+    /// 判定与逐帧领取时完全一致。领取后必须完整写完该 frame，避免半包。
+    fn claim_submit_attempts(&self, batch: &mut Vec<Outbound>) {
+        if !batch.iter().any(|outbound| outbound.submit_attempt.is_some()) {
+            return;
         }
-        let Some(entry) = pending.get_mut(&key.sequence_id) else {
-            return false;
-        };
-        if entry.submission_id != key.submission_id
-            || !matches!(
-                entry.state,
-                SubmitAttemptState::Queued { attempt } if attempt == key.attempt
-            )
+        let mut skipped: Vec<(u32, u32)> = Vec::new();
         {
-            return false;
+            let mut pending = self.pending_submits.write();
+            let _admission = self
+                .submit_admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let phase = self.phase();
+            let allowed = phase == ConnectionPhase::Open
+                || (phase == ConnectionPhase::Closing
+                    && self.drain_submits_on_close.load(Ordering::SeqCst));
+            let mut retained = 0usize;
+            for read in 0..batch.len() {
+                let key = batch[read].submit_attempt;
+                let claimed = match key {
+                    Some(key) => {
+                        let ok = allowed
+                            && pending.get_mut(&key.sequence_id).is_some_and(|entry| {
+                                if entry.submission_id != key.submission_id {
+                                    return false;
+                                }
+                                match entry.state {
+                                    SubmitAttemptState::Queued { attempt }
+                                        if attempt == key.attempt =>
+                                    {
+                                        entry.state = SubmitAttemptState::Writing {
+                                            attempt: key.attempt,
+                                        };
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            });
+                        if !ok {
+                            skipped.push((key.sequence_id, key.attempt));
+                        }
+                        ok
+                    }
+                    // 非 SUBMIT 帧（control / DELIVER_RESP 等）原样保留。
+                    None => true,
+                };
+                if claimed {
+                    if retained != read {
+                        batch[retained] =
+                            std::mem::replace(&mut batch[read], Outbound::plain(Bytes::new()));
+                    }
+                    retained += 1;
+                }
+            }
+            batch.truncate(retained);
         }
-        entry.state = SubmitAttemptState::Writing {
-            attempt: key.attempt,
-        };
-        true
+        for (sequence_id, attempt) in skipped {
+            log::debug!(
+                "跳过过期 SUBMIT attempt: seq_id={}, attempt={}",
+                sequence_id,
+                attempt
+            );
+        }
     }
 
-    /// 完整写出后才启动 response timeout；若写入期间已收到响应，则在这里释放窗口。
-    fn complete_submit_attempt(&self, key: SubmitAttemptKey, written_at: Instant) {
+    /// 批量完成已完整写出的 SUBMIT attempt：单次写锁处理整批
+    /// Writing→AwaitingResponse（超时预算从写出时刻起算），或在写入期间已
+    /// 收到响应（RespondedWhileWriting）时移除条目并释放窗口。
+    fn complete_submit_attempts(&self, keys: &[SubmitAttemptKey], written_at: Instant) {
+        if keys.is_empty() {
+            return;
+        }
         let mut pending = self.pending_submits.write();
-        let should_remove = pending.get_mut(&key.sequence_id).is_some_and(|entry| {
-            if entry.submission_id != key.submission_id {
-                return false;
+        for key in keys {
+            let should_remove = pending
+                .get_mut(&key.sequence_id)
+                .is_some_and(|entry| {
+                    if entry.submission_id != key.submission_id {
+                        return false;
+                    }
+                    match entry.state {
+                        SubmitAttemptState::Writing { attempt } if attempt == key.attempt => {
+                            entry.state = SubmitAttemptState::AwaitingResponse {
+                                attempt: key.attempt,
+                                written_at,
+                            };
+                            false
+                        }
+                        SubmitAttemptState::RespondedWhileWriting { attempt }
+                            if attempt == key.attempt =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    }
+                });
+            if should_remove {
+                pending.remove(&key.sequence_id);
             }
-            match entry.state {
-                SubmitAttemptState::Writing { attempt } if attempt == key.attempt => {
-                    entry.state = SubmitAttemptState::AwaitingResponse {
-                        attempt: key.attempt,
-                        written_at,
-                    };
-                    false
-                }
-                SubmitAttemptState::RespondedWhileWriting { attempt } if attempt == key.attempt => {
-                    true
-                }
-                _ => false,
-            }
-        });
-        if should_remove {
-            pending.remove(&key.sequence_id);
         }
     }
 
@@ -1005,9 +1129,11 @@ impl Inner {
         }
     }
 
-    fn make_event_ticket(&self, track_until_publish: bool) -> std::result::Result<EventTicket, ()> {
+    /// 创建延迟发布型事件的工单（仅 DELIVER 写门控路径使用）：工单在事件
+    /// 发布前保持追踪（drain_event_tickets 据此等待）。
+    fn make_event_ticket(&self) -> std::result::Result<EventTicket, ()> {
         let (event_tx, event_rx) = oneshot::channel();
-        let guard = track_until_publish.then(|| EventTicketGuard::new(self.event_tickets.clone()));
+        let guard = EventTicketGuard::new(self.event_tickets.clone());
         let item = EventSpoolItem::Event {
             event_rx,
             _depth_permit: EventDepthPermit::new(self.event_depth.clone()),
@@ -1017,14 +1143,15 @@ impl Inner {
         }
         Ok(EventTicket {
             event_tx: Some(event_tx),
-            _guard: guard,
+            _guard: Some(guard),
         })
     }
 
-    fn reserve_event(
+    /// 延迟发布型事件（DELIVER 写门控）的工单预留：溢出时进入 Overflowed 并
+    /// 触发有界关闭，但本事件仍尽力保留一个工单；工单在事件发布前保持追踪
+    /// （drain_event_tickets 据此等待）。
+    fn reserve_deferred_event(
         self: &Arc<Self>,
-        preserve_on_overflow: bool,
-        track_until_publish: bool,
     ) -> std::result::Result<EventTicket, EventReservationError> {
         let mut start_overload_close = false;
         let reservation = {
@@ -1039,7 +1166,7 @@ impl Inner {
                 EventAdmissionState::Overflowed => Err(EventReservationError::Overflowed),
                 EventAdmissionState::Open | EventAdmissionState::Draining => {
                     if self.event_depth.load(Ordering::SeqCst) < EVENT_SPOOL_NORMAL_CAPACITY {
-                        match self.make_event_ticket(track_until_publish) {
+                        match self.make_event_ticket() {
                             Ok(ticket) => Ok(ticket),
                             Err(()) => {
                                 *admission = EventAdmissionState::Overflowed;
@@ -1052,12 +1179,8 @@ impl Inner {
                         *admission = EventAdmissionState::Overflowed;
                         self.event_overflowed.store(true, Ordering::Release);
                         start_overload_close = true;
-                        if preserve_on_overflow {
-                            self.make_event_ticket(track_until_publish)
-                                .map_err(|()| EventReservationError::Overflowed)
-                        } else {
-                            Err(EventReservationError::Overflowed)
-                        }
+                        self.make_event_ticket()
+                            .map_err(|()| EventReservationError::Overflowed)
                     }
                 }
             }
@@ -1069,15 +1192,51 @@ impl Inner {
         reservation
     }
 
+    /// 立即发布型事件（SubmitResp / SubmitTimeout / SubmitDropped）的投递：
+    /// 事件本体直接进 spool（Direct 槽位），相比延迟工单少一次 oneshot 分配
+    /// 与一次 channel 跳转。admission 语义与原 reserve_event + publish 一致：
+    /// 溢出时进入 Overflowed 并触发有界关闭，但本期事件仍尽力投递一次。
     fn emit_event(self: &Arc<Self>, event: Event) -> bool {
-        let published = match self.reserve_event(true, false) {
-            Ok(ticket) => ticket.publish(event),
-            Err(_) => false,
+        let mut start_overload_close = false;
+        let sent = {
+            let mut admission = self
+                .event_admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match *admission {
+                EventAdmissionState::Terminal | EventAdmissionState::Sealed => false,
+                EventAdmissionState::Overflowed => false,
+                EventAdmissionState::Open | EventAdmissionState::Draining => {
+                    let item = EventSpoolItem::Direct {
+                        event,
+                        _depth_permit: EventDepthPermit::new(self.event_depth.clone()),
+                    };
+                    if self.event_depth.load(Ordering::SeqCst) < EVENT_SPOOL_NORMAL_CAPACITY {
+                        match self.event_spool_tx.try_send(item) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                *admission = EventAdmissionState::Overflowed;
+                                self.event_overflowed.store(true, Ordering::Release);
+                                start_overload_close = true;
+                                false
+                            }
+                        }
+                    } else {
+                        *admission = EventAdmissionState::Overflowed;
+                        self.event_overflowed.store(true, Ordering::Release);
+                        start_overload_close = true;
+                        self.event_spool_tx.try_send(item).is_ok()
+                    }
+                }
+            }
         };
-        if !published {
+        if start_overload_close {
+            self.start_event_overload_close();
+        }
+        if !sent {
             self.events_dropped.fetch_add(1, Ordering::Relaxed);
         }
-        published
+        sent
     }
 
     fn begin_event_drain(&self) {
@@ -1156,7 +1315,14 @@ impl Inner {
         self.start_event_overload_close();
     }
 
-    fn close_event_spool(&self) {
+    /// 关闭 event spool：admission 进入 Terminal，并向 dispatcher 发送终态
+    /// item（其唯一退出信号）。
+    ///
+    /// spool 暂满时 try_send 会失败——Terminal 一旦丢失，dispatcher 将永远
+    /// 阻塞在 recv() 上、事件通道永不关闭。因此失败时转入 detached 重试：
+    /// dispatcher 必然持续排空 spool（消费者背压超时后进入 discard 模式），
+    /// 重试必然收敛；dispatcher 已退出（channel 关闭）则放弃。
+    fn close_event_spool(self: &Arc<Self>) {
         let mut admission = self
             .event_admission
             .lock()
@@ -1165,6 +1331,7 @@ impl Inner {
             return;
         }
         *admission = EventAdmissionState::Terminal;
+        drop(admission);
         let reason = self
             .terminal_reason
             .lock()
@@ -1174,8 +1341,40 @@ impl Inner {
             reason,
             _depth_permit: EventDepthPermit::new(self.event_depth.clone()),
         };
-        if self.event_spool_tx.try_send(item).is_err() {
-            log::error!("CMPP event dispatcher 已退出，无法发布 connection 终态");
+        match self.event_spool_tx.try_send(item) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                log::warn!("event spool 已满，Terminal 终态进入重试投递");
+                let inner = self.clone();
+                let retry = async move {
+                    let mut item = item;
+                    let mut backoff = Duration::from_millis(5);
+                    loop {
+                        tokio::time::sleep(backoff).await;
+                        match inner.event_spool_tx.try_send(item) {
+                            Ok(()) => return,
+                            Err(mpsc::error::TrySendError::Full(returned)) => {
+                                item = returned;
+                                backoff = (backoff * 2).min(Duration::from_millis(100));
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                log::error!(
+                                    "CMPP event dispatcher 已退出，无法发布 connection 终态"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                };
+                if let Ok(runtime_handle) = tokio::runtime::Handle::try_current() {
+                    runtime_handle.spawn(retry);
+                } else {
+                    self.runtime_handle.spawn(retry);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                log::error!("CMPP event dispatcher 已退出，无法发布 connection 终态");
+            }
         }
     }
 
@@ -1205,7 +1404,7 @@ impl Inner {
         self.manual_batch_semaphore.close();
         let inner = self.clone();
         let cleanup = async move {
-            inner.fail_all_pending();
+            inner.fail_all_pending().await;
             inner.heartbeat_pending.write().clear();
             inner.pending_terminate.lock().await.take();
             inner.close_event_spool();
@@ -1950,7 +2149,7 @@ async fn reap_background_tasks(
     {
         log::warn!("等待 CMPP connection cleanup 完成超时，执行幂等兜底清理");
         let fallback_result = tokio::time::timeout(inner.response_timeout, async {
-            inner.fail_all_pending();
+            inner.fail_all_pending().await;
             inner.heartbeat_pending.write().clear();
             inner.pending_terminate.lock().await.take();
             inner.close_event_spool();
@@ -2094,6 +2293,20 @@ async fn event_dispatcher_task(
 
     while let Some(item) = event_spool_rx.recv().await {
         match item {
+            EventSpoolItem::Direct {
+                event,
+                _depth_permit,
+            } => {
+                dispatch_direct_event(&events_tx, &inner, &mut discard_events, event).await;
+            }
+            EventSpoolItem::Batch {
+                events,
+                _depth_permit,
+            } => {
+                for event in events {
+                    dispatch_direct_event(&events_tx, &inner, &mut discard_events, event).await;
+                }
+            }
             EventSpoolItem::Event {
                 event_rx,
                 _depth_permit,
@@ -2150,6 +2363,39 @@ async fn event_dispatcher_task(
     log::debug!("event dispatcher task 已退出");
 }
 
+/// 转发一个已就绪的事件到公开 event channel（Direct / Batch 共用）：
+/// discard 模式下仅计数，正常模式下受背压预算约束。
+async fn dispatch_direct_event(
+    events_tx: &mpsc::Sender<Event>,
+    inner: &Weak<Inner>,
+    discard_events: &mut bool,
+    event: Event,
+) {
+    if *discard_events {
+        if let Some(inner) = inner.upgrade() {
+            inner.events_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    if let Err(error) = dispatch_event_with_budget(events_tx, event).await {
+        *discard_events = true;
+        match error {
+            EventDispatchError::Backpressure => {
+                log::warn!(
+                    "event receiver 背压超过 {:?}，正在关闭 connection 并有界排空",
+                    EVENT_DISPATCH_BACKPRESSURE_TIMEOUT
+                );
+                if let Some(inner) = inner.upgrade() {
+                    inner.start_event_dispatch_backpressure_close();
+                }
+            }
+            EventDispatchError::Closed => {
+                log::debug!("event receiver 已丢弃；后续 event 将被有界排空");
+            }
+        }
+    }
+}
+
 enum EventDispatchError {
     Closed,
     Backpressure,
@@ -2193,6 +2439,8 @@ async fn writer_task(
     let mut control_burst = 0usize;
     let mut batch_buf = BytesMut::with_capacity(WRITE_BATCH_INITIAL_CAPACITY);
     let mut batch: Vec<Outbound> = Vec::with_capacity(WRITE_BATCH_MAX_FRAMES);
+    // 复用的批量 complete 缓冲：收集批内 SUBMIT attempt key，单次写锁完成转移。
+    let mut complete_keys: Vec<SubmitAttemptKey> = Vec::with_capacity(WRITE_BATCH_MAX_FRAMES);
     'outer: loop {
         let phase = inner.phase();
         if phase == ConnectionPhase::Closed {
@@ -2305,20 +2553,10 @@ async fn writer_task(
                 break;
             }
 
-            if is_submit {
-                let Some(key) = outbound.submit_attempt else {
-                    log::error!("submit queue 中存在缺少 attempt metadata 的报文");
-                    inner.finish(Some(Error::ChannelClosed));
-                    break 'outer;
-                };
-                if !inner.claim_submit_attempt(key) {
-                    log::debug!(
-                        "跳过过期 SUBMIT attempt: seq_id={}, attempt={}",
-                        key.sequence_id,
-                        key.attempt
-                    );
-                    continue;
-                }
+            if is_submit && outbound.submit_attempt.is_none() {
+                log::error!("submit queue 中存在缺少 attempt metadata 的报文");
+                inner.finish(Some(Error::ChannelClosed));
+                break 'outer;
             }
             if let Some(key) = outbound.heartbeat_attempt {
                 if !inner.claim_heartbeat_attempt(key) {
@@ -2361,6 +2599,9 @@ async fn writer_task(
             batch_bytes = batch_bytes.saturating_add(outbound.packet.len());
             batch.push(outbound);
         }
+
+        // —— 单次写锁批量领取整批 SUBMIT attempt（替代组批期间的逐帧 claim）——
+        inner.claim_submit_attempts(&mut batch);
 
         if batch.is_empty() {
             // 批次内没有需要写出的帧（全部被跳过，或只有 marker）。
@@ -2405,9 +2646,17 @@ async fn writer_task(
         match write_result {
             Ok(()) => {
                 let written_at = Instant::now();
+                // 单次写锁批量完成整批 SUBMIT attempt 的 Writing→AwaitingResponse
+                // 转移（或写入期间已响应时移除条目）。
+                complete_keys.clear();
+                for outbound in batch.iter() {
+                    if let Some(key) = outbound.submit_attempt {
+                        complete_keys.push(key);
+                    }
+                }
+                inner.complete_submit_attempts(&complete_keys, written_at);
                 for outbound in batch.drain(..) {
                     let Outbound {
-                        submit_attempt,
                         heartbeat_attempt,
                         marks_peer_terminate_response,
                         written_flag,
@@ -2415,9 +2664,6 @@ async fn writer_task(
                         written_tx,
                         ..
                     } = outbound;
-                    if let Some(key) = submit_attempt {
-                        inner.complete_submit_attempt(key, written_at);
-                    }
                     if let Some(key) = heartbeat_attempt {
                         inner.complete_heartbeat_attempt(key, written_at);
                     }
@@ -2456,6 +2702,12 @@ async fn writer_task(
 }
 
 /// 读取 frame，分发为 event，并自动回复 liveness/teardown PDU。
+///
+/// 读循环按“解码已缓冲帧 → flush 批量 SubmitResp → 阻塞读”三段推进：一次
+/// read syscall 通常带回多个完整帧，SUBMIT_RESP 的 pending 匹配与事件发布按
+/// 批合并（单次写锁），显著降低高吞吐下的锁次数。每个非 SubmitResp 帧处理
+/// 前也会 flush，保持事件流的原有顺序；read_idle 仍以“字节间空闲”为语义，
+/// 慢速但持续传输不会被误判为空闲连接。
 async fn reader_task(
     inner: Arc<Inner>,
     mut reader: OwnedReadHalf,
@@ -2464,185 +2716,192 @@ async fn reader_task(
     read_idle: Duration,
     mut phase_rx: watch::Receiver<ConnectionPhase>,
 ) {
-    let reason: Error = loop {
-        let frame = tokio::select! {
-            biased;
-            _ = wait_until_closed(&mut phase_rx) => return,
-            res = read_frame_with_idle(&mut reader, &mut codec, &mut read_buf, read_idle) => match res {
+    // 批量匹配缓冲：(sequence_id, msg_id, result)。
+    let mut pending_resps: Vec<(u32, [u8; 8], u8)> = Vec::with_capacity(SUBMIT_RESP_BATCH_MAX);
+    let reason: Error = 'outer: loop {
+        // —— 解码已缓冲的完整帧（无 syscall）。与原 biased select 一致：
+        //    Closed 之后不再消费缓冲中残留的帧 ——
+        loop {
+            if *phase_rx.borrow() == ConnectionPhase::Closed {
+                flush_submit_resps(&inner, &mut pending_resps);
+                return;
+            }
+            let frame = match codec.decode(&mut read_buf) {
                 Ok(Some(frame)) => frame,
-                Ok(None) => { log::info!("CMPP connection 已由 peer 关闭"); break Error::Closed; }
-                Err(Error::Timeout) => {
-                    log::warn!("CMPP read idle timeout（{}s）", read_idle.as_secs());
-                    break Error::Timeout;
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!("CMPP decode 错误: {}", e);
+                    flush_submit_resps(&inner, &mut pending_resps);
+                    break 'outer e;
                 }
-                Err(e) => { log::warn!("CMPP decode/读取错误: {}", e); break e; }
-            }
-        };
+            };
 
-        let Frame { sequence_id, pdu } = frame;
-        match pdu {
-            Pdu::SubmitResp(resp) => {
-                let handled = {
-                    let mut map = inner.pending_submits.write();
-                    match map.get(&sequence_id).map(|entry| entry.state) {
-                        Some(SubmitAttemptState::Writing { attempt }) => {
-                            if let Some(entry) = map.get_mut(&sequence_id) {
-                                entry.state = SubmitAttemptState::RespondedWhileWriting { attempt };
-                            }
-                            true
-                        }
-                        Some(SubmitAttemptState::RespondedWhileWriting { .. }) => false,
-                        Some(
-                            SubmitAttemptState::Queued { .. }
-                            | SubmitAttemptState::AwaitingResponse { .. },
-                        ) => {
-                            map.remove(&sequence_id);
-                            true
-                        }
-                        None => false,
+            let Frame { sequence_id, pdu } = frame;
+            match pdu {
+                Pdu::SubmitResp(resp) => {
+                    pending_resps.push((sequence_id, resp.msg_id, resp.result));
+                    if pending_resps.len() >= SUBMIT_RESP_BATCH_MAX {
+                        flush_submit_resps(&inner, &mut pending_resps);
                     }
-                };
-                if handled {
-                    inner.submit_responses.fetch_add(1, Ordering::Relaxed);
-                    if inner.event_overflowed.load(Ordering::Acquire) {
-                        log::debug!(
-                            "event backlog 关闭期间收到 SUBMIT_RESP seq_id={}，仅完成协议状态迁移",
-                            sequence_id
-                        );
-                        inner.events_dropped.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        let _ = inner.emit_event(Event::SubmitResp {
-                            sequence_id,
-                            msg_id: resp.msg_id,
-                            result: resp.result,
-                        });
-                    }
-                } else {
-                    log::debug!("收到未知或重复 seq_id={} 的 SUBMIT_RESP", sequence_id);
                 }
-            }
-            Pdu::Deliver(deliver) => {
-                inner.delivers_received.fetch_add(1, Ordering::Relaxed);
-                let event_ticket = match inner.reserve_event(true, true) {
-                    Ok(ticket) => ticket,
-                    Err(EventReservationError::Overflowed) => {
-                        log::debug!("event backlog 关闭期间忽略未确认的 DELIVER");
-                        return;
-                    }
-                    Err(EventReservationError::Closed) => return,
-                };
-                let resp = Frame::new(
-                    sequence_id,
-                    Pdu::DeliverResp(DeliverResp {
-                        msg_id: deliver.msg_id,
-                        result: 0,
-                    }),
-                );
-                let response_budget_started_at = Instant::now();
-                let outbound = Outbound::event_after_write(
-                    resp.encode(),
-                    response_budget_started_at,
-                    event_ticket,
-                    Event::Deliver(deliver),
-                );
-                let remaining = inner
-                    .response_timeout
-                    .checked_sub(response_budget_started_at.elapsed())
-                    .filter(|remaining| !remaining.is_zero());
-                let Some(remaining) = remaining else {
-                    log::warn!("CMPP DELIVER_RESP pipeline 响应超时");
-                    break Error::Timeout;
-                };
-                match tokio::time::timeout(
-                    remaining,
-                    send_outbound_until_closed(&inner.control_tx, outbound, &mut phase_rx),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(())) => {
-                        if inner.phase() == ConnectionPhase::Closed {
+                Pdu::Deliver(deliver) => {
+                    flush_submit_resps(&inner, &mut pending_resps);
+                    inner.delivers_received.fetch_add(1, Ordering::Relaxed);
+                    let event_ticket = match inner.reserve_deferred_event() {
+                        Ok(ticket) => ticket,
+                        Err(EventReservationError::Overflowed) => {
+                            log::debug!("event backlog 关闭期间忽略未确认的 DELIVER");
                             return;
                         }
-                        break Error::ChannelClosed;
-                    }
-                    Err(_) => {
-                        log::warn!("CMPP DELIVER_RESP pipeline 入队超时");
-                        break Error::Timeout;
-                    }
-                }
-            }
-            Pdu::ActiveTest => {
-                if send_until_closed(
-                    &inner.control_tx,
-                    Frame::new(sequence_id, Pdu::ActiveTestResp).encode(),
-                    &mut phase_rx,
-                )
-                .await
-                .is_err()
-                {
-                    break Error::ChannelClosed;
-                }
-            }
-            Pdu::ActiveTestResp => {
-                inner.heartbeat_pending.write().remove(&sequence_id);
-            }
-            Pdu::Terminate => {
-                log::info!("peer 发送 CMPP_TERMINATE，正在拆除");
-                inner.peer_terminate_seen.store(true, Ordering::SeqCst);
-                inner.begin_closing(false);
-                inner.begin_event_drain();
-                let (outbound, written_rx) = Outbound::peer_terminate_response(
-                    Frame::new(sequence_id, Pdu::TerminateResp).encode(),
-                );
-                let response_result = tokio::time::timeout(inner.response_timeout, async {
-                    send_outbound_until_closed(&inner.control_tx, outbound, &mut phase_rx)
-                        .await
-                        .map_err(|_| ())?;
-                    written_rx.await.map_err(|_| ())
-                })
-                .await;
-                if response_result.is_err() {
-                    log::warn!("CMPP TERMINATE_RESP write 超时");
-                }
-                let response_written = matches!(response_result, Ok(Ok(())));
-                let local_terminate_written = inner
-                    .pending_terminate
-                    .lock()
-                    .await
-                    .as_ref()
-                    .is_some_and(|pending| pending.written.load(Ordering::Acquire));
-                if response_written && local_terminate_written {
-                    continue;
-                }
-                break Error::Terminated;
-            }
-            Pdu::TerminateResp => {
-                log::debug!("收到 TERMINATE_RESP seq_id={}", sequence_id);
-                let response_tx = {
-                    let mut pending = inner.pending_terminate.lock().await;
-                    if pending
-                        .as_ref()
-                        .is_some_and(|pending| pending.sequence_id == sequence_id)
-                    {
-                        pending.take().map(|pending| pending.response_tx)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(response_tx) = response_tx {
-                    let _ = response_tx.send(());
-                }
-            }
-            other => {
-                inner.unexpected_pdus.fetch_add(1, Ordering::Relaxed);
-                if let Some(suppressed) = take_unexpected_pdu_log_slot(&inner) {
-                    log::warn!(
-                        "收到非预期入站 PDU: {:#010x}（自上次警告以来抑制 {} 条）",
-                        other.command_id(),
-                        suppressed
+                        Err(EventReservationError::Closed) => return,
+                    };
+                    let resp = Frame::new(
+                        sequence_id,
+                        Pdu::DeliverResp(DeliverResp {
+                            msg_id: deliver.msg_id,
+                            result: 0,
+                        }),
                     );
+                    let response_budget_started_at = Instant::now();
+                    let outbound = Outbound::event_after_write(
+                        resp.encode(),
+                        response_budget_started_at,
+                        event_ticket,
+                        Event::Deliver(deliver),
+                    );
+                    let remaining = inner
+                        .response_timeout
+                        .checked_sub(response_budget_started_at.elapsed())
+                        .filter(|remaining| !remaining.is_zero());
+                    let Some(remaining) = remaining else {
+                        log::warn!("CMPP DELIVER_RESP pipeline 响应超时");
+                        break 'outer Error::Timeout;
+                    };
+                    match tokio::time::timeout(
+                        remaining,
+                        send_outbound_until_closed(&inner.control_tx, outbound, &mut phase_rx),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(())) => {
+                            if inner.phase() == ConnectionPhase::Closed {
+                                return;
+                            }
+                            break 'outer Error::ChannelClosed;
+                        }
+                        Err(_) => {
+                            log::warn!("CMPP DELIVER_RESP pipeline 入队超时");
+                            break 'outer Error::Timeout;
+                        }
+                    }
                 }
+                Pdu::ActiveTest => {
+                    flush_submit_resps(&inner, &mut pending_resps);
+                    if send_until_closed(
+                        &inner.control_tx,
+                        Frame::new(sequence_id, Pdu::ActiveTestResp).encode(),
+                        &mut phase_rx,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break 'outer Error::ChannelClosed;
+                    }
+                }
+                Pdu::ActiveTestResp => {
+                    flush_submit_resps(&inner, &mut pending_resps);
+                    inner.heartbeat_pending.write().remove(&sequence_id);
+                }
+                Pdu::Terminate => {
+                    flush_submit_resps(&inner, &mut pending_resps);
+                    log::info!("peer 发送 CMPP_TERMINATE，正在拆除");
+                    inner.peer_terminate_seen.store(true, Ordering::SeqCst);
+                    inner.begin_closing(false);
+                    inner.begin_event_drain();
+                    let (outbound, written_rx) = Outbound::peer_terminate_response(
+                        Frame::new(sequence_id, Pdu::TerminateResp).encode(),
+                    );
+                    let response_result = tokio::time::timeout(inner.response_timeout, async {
+                        send_outbound_until_closed(&inner.control_tx, outbound, &mut phase_rx)
+                            .await
+                            .map_err(|_| ())?;
+                        written_rx.await.map_err(|_| ())
+                    })
+                    .await;
+                    if response_result.is_err() {
+                        log::warn!("CMPP TERMINATE_RESP write 超时");
+                    }
+                    let response_written = matches!(response_result, Ok(Ok(())));
+                    let local_terminate_written = inner
+                        .pending_terminate
+                        .lock()
+                        .await
+                        .as_ref()
+                        .is_some_and(|pending| pending.written.load(Ordering::Acquire));
+                    if response_written && local_terminate_written {
+                        continue;
+                    }
+                    break 'outer Error::Terminated;
+                }
+                Pdu::TerminateResp => {
+                    flush_submit_resps(&inner, &mut pending_resps);
+                    log::debug!("收到 TERMINATE_RESP seq_id={}", sequence_id);
+                    let response_tx = {
+                        let mut pending = inner.pending_terminate.lock().await;
+                        if pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.sequence_id == sequence_id)
+                        {
+                            pending.take().map(|pending| pending.response_tx)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(response_tx) = response_tx {
+                        let _ = response_tx.send(());
+                    }
+                }
+                other => {
+                    flush_submit_resps(&inner, &mut pending_resps);
+                    inner.unexpected_pdus.fetch_add(1, Ordering::Relaxed);
+                    if let Some(suppressed) = take_unexpected_pdu_log_slot(&inner) {
+                        log::warn!(
+                            "收到非预期入站 PDU: {:#010x}（自上次警告以来抑制 {} 条）",
+                            other.command_id(),
+                            suppressed
+                        );
+                    }
+                }
+            }
+        }
+
+        // —— 缓冲耗尽：先落地累积的 SubmitResp，再阻塞等待 socket ——
+        flush_submit_resps(&inner, &mut pending_resps);
+        let bytes_read = tokio::select! {
+            biased;
+            _ = wait_until_closed(&mut phase_rx) => return,
+            res = tokio::time::timeout(read_idle, reader.read_buf(&mut read_buf)) => match res {
+                Ok(Ok(bytes_read)) => bytes_read,
+                Ok(Err(e)) => {
+                    log::warn!("CMPP 读取错误: {}", e);
+                    break 'outer Error::Io(e);
+                }
+                Err(_) => {
+                    log::warn!("CMPP read idle timeout（{}s）", read_idle.as_secs());
+                    break 'outer Error::Timeout;
+                }
+            }
+        };
+        if bytes_read == 0 {
+            log::info!("CMPP connection 已由 peer 关闭");
+            flush_submit_resps(&inner, &mut pending_resps);
+            // 保持 FramedRead 的 EOF 语义：残留的不完整帧会得到 “bytes
+            // remaining on stream” 错误，而不是把截断帧当作正常 peer close。
+            // 内层解码循环已消费全部完整帧，decode_eof 不可能再产出帧。
+            match codec.decode_eof(&mut read_buf) {
+                Ok(_) => break 'outer Error::Closed,
+                Err(e) => break 'outer e,
             }
         }
     };
@@ -2651,31 +2910,67 @@ async fn reader_task(
     log::debug!("reader task 已退出");
 }
 
-/// 以“字节间 idle”而非“整帧完成期限”读取一个 CMPP frame。
-///
-/// codec 先消费 handshake 阶段可能已经 read-ahead 的 buffer；只有在 buffer
-/// 仍不足以组成完整 frame 时才等待 socket。每次成功读到字节都会重新开始
-/// `read_idle`，慢速但持续传输不会被误判为空闲连接。
-async fn read_frame_with_idle(
-    reader: &mut OwnedReadHalf,
-    codec: &mut CmppFrameCodec,
-    read_buf: &mut BytesMut,
-    read_idle: Duration,
-) -> Result<Option<Frame>> {
-    loop {
-        if let Some(frame) = codec.decode(read_buf)? {
-            return Ok(Some(frame));
+/// 批量落地累积的 SUBMIT_RESP：单次 `pending_submits` 写锁完成整批匹配与
+/// 移除，事件按到达顺序发布。逐条语义与原实现一致：Writing 状态迁移为
+/// RespondedWhileWriting（事件立即发出，写完时移除条目）；Queued /
+/// AwaitingResponse 直接移除（Queued 命中意味着迟到响应抵消了排队中的
+/// 重传）；RespondedWhileWriting / 未知 seq 视为重复响应，仅 debug 日志。
+fn flush_submit_resps(inner: &Arc<Inner>, pending_resps: &mut Vec<(u32, [u8; 8], u8)>) {
+    if pending_resps.is_empty() {
+        return;
+    }
+    let mut unknown: Vec<u32> = Vec::new();
+    {
+        let mut map = inner.pending_submits.write();
+        let mut retained = 0usize;
+        for read in 0..pending_resps.len() {
+            let (sequence_id, msg_id, result) = pending_resps[read];
+            let handled = match map.get(&sequence_id).map(|entry| entry.state) {
+                Some(SubmitAttemptState::Writing { attempt }) => {
+                    if let Some(entry) = map.get_mut(&sequence_id) {
+                        entry.state = SubmitAttemptState::RespondedWhileWriting { attempt };
+                    }
+                    true
+                }
+                Some(SubmitAttemptState::RespondedWhileWriting { .. }) => false,
+                Some(
+                    SubmitAttemptState::Queued { .. }
+                    | SubmitAttemptState::AwaitingResponse { .. },
+                ) => {
+                    map.remove(&sequence_id);
+                    true
+                }
+                None => false,
+            };
+            if handled {
+                pending_resps[retained] = (sequence_id, msg_id, result);
+                retained += 1;
+            } else {
+                unknown.push(sequence_id);
+            }
         }
-        let bytes_read = tokio::time::timeout(read_idle, reader.read_buf(read_buf))
-            .await
-            .map_err(|_| Error::Timeout)??;
-        if bytes_read == 0 {
-            // 保持 FramedRead 的 EOF 语义：若 buffer 中还有不完整的 CMPP
-            // frame，decode_eof 会返回“bytes remaining”错误，而不是把截断帧
-            // 当作正常 peer close。
-            return codec.decode_eof(read_buf);
+        pending_resps.truncate(retained);
+    }
+    for &(sequence_id, msg_id, result) in pending_resps.iter() {
+        inner.submit_responses.fetch_add(1, Ordering::Relaxed);
+        if inner.event_overflowed.load(Ordering::Acquire) {
+            log::debug!(
+                "event backlog 关闭期间收到 SUBMIT_RESP seq_id={}，仅完成协议状态迁移",
+                sequence_id
+            );
+            inner.events_dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let _ = inner.emit_event(Event::SubmitResp {
+                sequence_id,
+                msg_id,
+                result,
+            });
         }
     }
+    for sequence_id in unknown {
+        log::debug!("收到未知或重复 seq_id={} 的 SUBMIT_RESP", sequence_id);
+    }
+    pending_resps.clear();
 }
 
 /// 在没有未完成 heartbeat 时周期性发送 ACTIVE_TEST。
@@ -2891,7 +3186,7 @@ async fn timeout_task(inner: Arc<Inner>, mut phase_rx: watch::Receiver<Connectio
 
         for (_, key) in expired_submits.drain(..) {
             if key.attempt >= retry_count {
-                let ticket = {
+                let retired = {
                     let mut map = inner.pending_submits.write();
                     let still_expired = map.get(&key.sequence_id).is_some_and(|pending| {
                         pending.submission_id == key.submission_id
@@ -2904,23 +3199,20 @@ async fn timeout_task(inner: Arc<Inner>, mut phase_rx: watch::Receiver<Connectio
                     if !still_expired {
                         None
                     } else {
-                        match inner.reserve_event(true, false) {
-                            Ok(ticket) => {
-                                if let Some(mut pending) = map.remove(&key.sequence_id) {
-                                    let retired = pending._sequence_lease.retire();
-                                    Some((ticket, retired))
-                                } else {
-                                    None
-                                }
-                            }
-                            Err(_) => None,
+                        // Direct 事件在持有 pending 写锁时投递：事件发布与条目移除
+                        // 原子化；投递失败（admission 关闭/溢出）则保留条目，下一轮
+                        // 扫描重试或由 fail_all_pending 兜底（与原 reserve 语义一致）。
+                        if !inner.emit_event(Event::SubmitTimeout {
+                            sequence_id: key.sequence_id,
+                        }) {
+                            None
+                        } else {
+                            map.remove(&key.sequence_id)
+                                .map(|mut pending| pending._sequence_lease.retire())
                         }
                     }
                 };
-                if let Some((ticket, retired)) = ticket {
-                    let _ = ticket.publish(Event::SubmitTimeout {
-                        sequence_id: key.sequence_id,
-                    });
+                if let Some(retired) = retired {
                     inner.submit_timeouts.fetch_add(1, Ordering::Relaxed);
                     timed_out_submits += 1;
                     if timeout_samples.len() < SUBMIT_TIMEOUT_LOG_SAMPLES {

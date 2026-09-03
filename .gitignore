@@ -33,4 +33,4 @@ rust-project.json
 *.pdf
 
 ### logs
-logs/
+logs/.zcode/

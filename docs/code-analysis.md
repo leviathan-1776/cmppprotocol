@@ -417,11 +417,15 @@ SubmitOptions 模板化 + 惰性分片编码、UDH 池 4096 分片 + 随机起�
 | 批次 | 内容 | 解决 | 风险 |
 |---|---|---|---|
 | R-0 | 本报告落盘 | — | 无 |
-| R-1 | 热路径：writer 批内锁合并（claim/complete 批量化）+ 事件直通变体（立即发布事件免 oneshot）+ reader SubmitResp 批量匹配 | P-1, P-2, P-3 | 中（需保语义红线） |
-| R-2 | 完整性：拆连终态事件分批送达 + 丢弃日志；`Error::ResourceExhausted` + `is_retryable()`；`SubmitTimeout` 携带 attempts | I-1, I-2, I-3 | 低 |
+| R-1 ✅ | 热路径：writer 批内锁合并（claim/complete 批量化）+ 事件直通变体（立即发布事件免 oneshot）+ reader SubmitResp 批量匹配；**附带提前完成 R-2 的拆连终态事件分批**——实测发现大窗口饱和拆连时 `close_event_spool` 的 Terminal 会被满 spool 挤掉，dispatcher 永久阻塞（进程挂起），故将 SubmitDropped 分批（128/槽）与 Terminal 重试投递一并落地 | P-1, P-2, P-3, I-1 | 中（需保语义红线） |
+| R-2 | 完整性：`Error::ResourceExhausted` + `is_retryable()`；`SubmitTimeout` 携带 attempts | I-2, I-3 | 低 |
 | R-3 | 配置暴露（背压超时/spool 容量与 window 联动/批量参数/TCP）+ metrics 增强（批大小、事件深度峰值） | §6 | 低 |
 | R-4 | 故障注入 mock + 补齐 §7 全部缺口测试 | §7 | 低 |
 | R-5 | 微优化（按 R-1 后的新基准数据决定）：DELIVER 解码减分配、UCS-2 chunks、codec reserve、timeout 索引化 | P-4~P-7 | 低 |
+
+R-1 实测（Windows，loopback window=256 parallel=8）：峰值吞吐 311k → 377k
+segments/s（+21%），事件丢弃 107 → 0-70，修复前约 1/3 概率进程挂起、修复后
+6/6 干净退出；RTT 50ms 场景 4.1k segments/s 与基线一致。
 
 **语义红线**（任何批次不得破坏）：每 seq 恰好一个终态事件；DELIVER 写门控；事件全局
 FIFO 顺序；UDH 隔离；超时预算起算点；锁序 `pending_submits → submit_admission`。
