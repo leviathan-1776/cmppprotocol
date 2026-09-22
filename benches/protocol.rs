@@ -38,6 +38,10 @@ fn sample_submit(dest_count: usize) -> Submit {
 }
 
 fn bench_protocol(c: &mut Criterion) {
+    let msg_id = [0, 1, 15, 16, 127, 128, 254, 255];
+    c.bench_function("msg_id_hex", |b| {
+        b.iter(|| cmppprotocol::Event::msg_id_hex(black_box(&msg_id)))
+    });
     c.bench_function("pdu_encode_submit_1dest", |b| {
         b.iter_batched(
             || Pdu::Submit(Box::new(sample_submit(1))),

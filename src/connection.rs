@@ -111,7 +111,7 @@ pub enum Event {
 impl Event {
     /// 8-byte message id 的小写 hex 表示（`SubmitResp` helper）。
     pub fn msg_id_hex(msg_id: &[u8; 8]) -> String {
-        msg_id.iter().map(|b| format!("{:02x}", b)).collect()
+        crate::pdu::msg_id_hex(msg_id)
     }
 }
 

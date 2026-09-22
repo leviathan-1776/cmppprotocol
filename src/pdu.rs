@@ -649,7 +649,7 @@ pub struct DeliverReport {
 impl DeliverReport {
     /// [`DeliverReport::msg_id`] 的小写 hex 表示。
     pub fn msg_id_hex(&self) -> String {
-        self.msg_id.iter().map(|b| format!("{:02x}", b)).collect()
+        msg_id_hex(&self.msg_id)
     }
 
     /// 解析 60-byte status report payload。长度不足时返回 `None`。
@@ -675,6 +675,17 @@ impl DeliverReport {
             smsc_sequence,
         })
     }
+}
+
+/// 固定 8 字节消息号：只分配一次，避免逐字节创建临时格式化字符串。
+pub(crate) fn msg_id_hex(msg_id: &[u8; 8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(16);
+    for &byte in msg_id {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 // ---- 小型 binary helpers ----
@@ -897,5 +908,23 @@ mod tests {
     fn decode_rejects_short_body() {
         let err = SubmitResp::decode(&[0u8; 3]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn message_id_hex_preserves_all_bytes_and_leading_zeroes() {
+        for byte in 0..=u8::MAX {
+            let id = [0, byte, 15, 16, 127, 128, 254, 255];
+            let expected = format!("00{byte:02x}0f107f80feff");
+            assert_eq!(crate::Event::msg_id_hex(&id), expected);
+            let report = DeliverReport {
+                msg_id: id,
+                stat: String::new(),
+                submit_time: String::new(),
+                done_time: String::new(),
+                dest_terminal_id: String::new(),
+                smsc_sequence: 0,
+            };
+            assert_eq!(report.msg_id_hex(), expected);
+        }
     }
 }

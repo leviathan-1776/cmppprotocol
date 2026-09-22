@@ -116,8 +116,33 @@ async fn main() -> cmppprotocol::Result<()> {
 
 ## 性能
 
+本轮完整核验见 [性能核验记录](docs/performance-validation.md)。消息号格式化微基准耗时约减少
+93.4%；这不代表短信吞吐提升。默认 spool=256 的饱和 loopback 短测仍有提前关闭，显式配置
+1024 槽的三轮短测达到约 38.3 万分片/秒且零丢弃；默认值保持不变。
+
 运行时 metrics（`conn.metrics()`）提供 admitted / responses / retries / timeouts /
 delivers / dropped events / in-flight 计数，适合接入监控系统。
+
+`CmppProtocolParams` 提供以下调优参数，默认设置延续此前行为：
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `event_backpressure_timeout_ms` | 1000 | 公开事件通道投递等待预算，毫秒，须大于 0 |
+| `event_spool_capacity` | 256 | 普通 spool 槽数，1–16384；实际至少 `ceil(window_size / 128)`，另留 2 个紧急槽 |
+| `write_batch_max_frames` | 64 | 每批最多协议帧数，1–16384 |
+| `write_batch_max_bytes` | 65536 | 组批字节阈值，须大于 0；完整加入最后一帧后可超出阈值 |
+| `tcp_nodelay` | true | TCP_NODELAY 开关 |
+| `tcp_keepalive_secs` | Some(60) | keepalive 空闲秒数，None 禁用 |
+| `tcp_keepalive_interval_secs` | 10 | keepalive 探测间隔秒数，启用时须大于 0 |
+
+keepalive 秒数换算毫秒后不得超过 `u32::MAX`；TCP 选项设置失败沿用告警并继续运行的行为。
+完整列出所有字段的配置初始化需补充新字段，也可使用 `..CmppProtocolParams::default()`。
+spool 容量按工单计，拆连批次每个工单最多含 128 个事件；增大容量不提供无条件终态必达保证。
+
+新增 `write_batches` / `write_frames` 统计握手后成功完整写出的批次与帧数，包含控制帧和重传，
+失败批次不计入。平均批大小为 `write_frames / write_batches`（批次数为 0 时取 0）。
+`event_depth_peak` 是内部工单持有事件数的峰值，包含 dispatcher 当前工单、尝试入队的工单和
+Terminal，批次按事件数计，不包含公开事件通道缓存。指标独立采样，运行中的快照不是原子快照。
 
 ### 微基准
 
@@ -137,9 +162,11 @@ cargo bench --bench protocol
 cargo run --release --example loadtest -- duration=6 window=256 delay_ms=50 parallel=8
 # 长短信（8 段）+ 自定义 UDH cooldown：
 cargo run --release --example loadtest -- duration=6 long=1 udh_cooldown_ms=500
+# 对比组批与事件配置（输出平均批大小及内部事件深度峰值）：
+cargo run --release --example loadtest -- duration=6 window=256 delay_ms=0 parallel=8 batch_frames=64 batch_bytes=65536 spool_capacity=256 event_timeout_ms=1000
 ```
 
-实测参考（Windows，单连接）：
+历史实测参考（Windows，单连接；不代表本轮改动已取得相同吞吐或提升）：
 
 | 场景 | 实测吞吐 | 说明 |
 |---|---|---|
