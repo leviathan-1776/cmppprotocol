@@ -2794,6 +2794,7 @@ async fn reader_task(
 ) {
     // 批量匹配缓冲：(sequence_id, msg_id, result)。
     let mut pending_resps: Vec<(u32, [u8; 8], u8)> = Vec::with_capacity(SUBMIT_RESP_BATCH_MAX);
+    let mut local_terminate_acked = false;
     let reason: Error = 'outer: loop {
         // —— 解码已缓冲的完整帧（无 syscall）。与原 biased select 一致：
         //    Closed 之后不再消费缓冲中残留的帧 ——
@@ -2935,6 +2936,7 @@ async fn reader_task(
                         }
                     };
                     if let Some(response_tx) = response_tx {
+                        local_terminate_acked = true;
                         let _ = response_tx.send(());
                     }
                 }
@@ -2976,6 +2978,9 @@ async fn reader_task(
             // remaining on stream” 错误，而不是把截断帧当作正常 peer close。
             // 内层解码循环已消费全部完整帧，decode_eof 不可能再产出帧。
             match codec.decode_eof(&mut read_buf) {
+                // 合法 TERMINATE_RESP 后的 EOF 属于正常握手收尾，由 close driver
+                // 完成事件排空；不能抢先发布 Disconnected(Closed)。截断帧仍报错。
+                Ok(_) if local_terminate_acked => return,
                 Ok(_) => break 'outer Error::Closed,
                 Err(e) => break 'outer e,
             }
@@ -3412,6 +3417,73 @@ fn log_submit_timeout_batch(count: usize, samples: &[u32]) {
 #[cfg(test)]
 mod performance_config_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn late_response_cancels_queued_attempt_before_writer_claim() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (seen_tx, seen_rx) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut frames = FramedRead::new(read, CmppFrameCodec);
+                let login = frames.next().await.unwrap().unwrap();
+                let Pdu::Connect(connect) = login.pdu else { panic!("期望 CONNECT") };
+                let response = Pdu::ConnectResp(crate::pdu::ConnectResp {
+                    status: 0,
+                    authenticator_ismg: compute_authenticator_ismg(0, &connect.authenticator_source, "secret"),
+                    version: crate::CMPP_VERSION_20,
+                });
+                write.write_all(&response.encode(login.sequence_id)).await.unwrap();
+                let mut seen_tx = Some(seen_tx);
+                while let Some(frame) = frames.next().await {
+                    let frame = frame.unwrap();
+                    match frame.pdu {
+                        Pdu::Submit(_) => { seen_tx.take().expect("不应实际写出重传帧").send(()).unwrap(); }
+                        Pdu::ActiveTest => { write.write_all(&Pdu::ActiveTestResp.encode(frame.sequence_id)).await.unwrap(); }
+                        Pdu::Terminate => {
+                            write.write_all(&Pdu::TerminateResp.encode(frame.sequence_id)).await.unwrap();
+                            break;
+                        }
+                        other => panic!("意外 PDU: {:?}", other),
+                    }
+                }
+            });
+            let conn = CmppConnection::connect(CmppConfig {
+                host: "127.0.0.1".into(), port: address.port() as i32,
+                account: "901234".into(), password: "secret".into(),
+                version: crate::CMPP_VERSION_20,
+                protocol_params: crate::config::CmppProtocolParams::default(),
+            }).await.unwrap();
+            let mut events = conn.take_events().await.unwrap();
+            let opts = SubmitOptions::new("LATE", "901234", "10690112", "13800138112");
+            let seq = conn.submit(&opts, "queued", None).await.unwrap()[0];
+            seen_rx.await.unwrap();
+            // 状态级故障注入：模拟 timeout 已排入 attempt 2，而 writer 尚未领取。
+            // 以下步骤不 await，确定性覆盖迟到响应先于批量领取的顺序。
+            let (key, packet) = {
+                let mut pending = conn.inner.pending_submits.write();
+                let entry = pending.get_mut(&seq).unwrap();
+                assert!(matches!(entry.state, SubmitAttemptState::AwaitingResponse { attempt: 1, .. }));
+                entry.state = SubmitAttemptState::Queued { attempt: 2 };
+                (SubmitAttemptKey { sequence_id: seq, submission_id: entry.submission_id, attempt: 2 }, entry.packet.clone())
+            };
+            let mut batch = vec![Outbound::submit(packet, key)];
+            flush_submit_resps(&conn.inner, &mut vec![(seq, [7; 8], 0)]);
+            conn.inner.claim_submit_attempts(&mut batch);
+            assert!(batch.is_empty(), "已响应的旧 attempt 必须从写批次剔除");
+            conn.inner.complete_submit_attempts(&[key], Instant::now());
+            flush_submit_resps(&conn.inner, &mut vec![(seq, [7; 8], 0)]);
+            assert!(!conn.inner.pending_submits.read().contains_key(&seq));
+            assert_eq!(conn.metrics().submit_responses, 1);
+            assert_eq!(conn.metrics().submits_in_flight, 0);
+            assert!(matches!(events.recv().await, Some(Event::SubmitResp { sequence_id, .. }) if sequence_id == seq));
+            conn.close().await;
+            assert!(events.recv().await.is_none(), "重复响应和旧 attempt 不能追加终态");
+            server.await.unwrap();
+        }).await.expect("排队重传取消测试超时");
+    }
 
     #[tokio::test]
     async fn tcp_options_are_applied_to_socket() {
