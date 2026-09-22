@@ -117,8 +117,9 @@ async fn main() -> cmppprotocol::Result<()> {
 ## 性能
 
 本轮完整核验见 [性能核验记录](docs/performance-validation.md)。消息号格式化微基准耗时约减少
-93.4%；这不代表短信吞吐提升。默认 spool=256 的饱和 loopback 短测仍有提前关闭，显式配置
-1024 槽的三轮短测达到约 38.3 万分片/秒且零丢弃；默认值保持不变。
+93.4%；这不代表短信吞吐提升。后续事件投递快速路径在默认 spool=256 下通过三轮短测和
+20 秒饱和 loopback（约 38.4 万分片/秒，零丢弃）。默认容量与背压关闭约定保持不变，
+这些本地测试不构成任意负载下不积压的保证。
 
 运行时 metrics（`conn.metrics()`）提供 admitted / responses / retries / timeouts /
 delivers / dropped events / in-flight 计数，适合接入监控系统。

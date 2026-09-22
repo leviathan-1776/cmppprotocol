@@ -2487,6 +2487,17 @@ async fn dispatch_event_with_budget(
     event: Event,
     backpressure_timeout: Duration,
 ) -> std::result::Result<(), EventDispatchError> {
+    // 通道有空位时不创建 timeout，也不经过异步 reserve 的协作预算扣减。
+    // 仍原子预留两个槽，保留 Disconnected 的位置；单 dispatcher 保持 FIFO。
+    match events_tx.try_reserve_many(2) {
+        Ok(mut permits) => {
+            let permit = permits.next().ok_or(EventDispatchError::Closed)?;
+            permit.send(event);
+            return Ok(());
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => return Err(EventDispatchError::Closed),
+        Err(mpsc::error::TrySendError::Full(_)) => {}
+    }
     let mut permits = tokio::time::timeout(backpressure_timeout, events_tx.reserve_many(2))
         .await
         .map_err(|_| EventDispatchError::Backpressure)?
