@@ -42,7 +42,9 @@
 //!                     println!("报告 {} -> {}", report.msg_id_hex(), report.stat);
 //!                 }
 //!             }
-//!             Event::SubmitTimeout { sequence_id } => println!("超时 seq={}", sequence_id),
+//!             Event::SubmitTimeout { sequence_id, attempts } => {
+//!                 println!("超时 seq={}（已尝试 {} 次）", sequence_id, attempts)
+//!             }
 //!             Event::SubmitDropped { sequence_id } => {
 //!                 println!("连接断开，未收到响应 seq={}", sequence_id)
 //!             }

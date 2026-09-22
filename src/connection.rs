@@ -94,12 +94,17 @@ pub enum Event {
     SubmitTimeout {
         /// timeout 的 SUBMIT 的 Sequence id。
         sequence_id: u32,
+        /// 该 segment 完整写出到 socket 的尝试次数（含首次，不代表网关已接收）。at-least-once
+        /// 语义下网关可能已受理其中任意一次——次数越大重复风险越高，调用方
+        /// 可据此决定是否整条重发。
+        attempts: u32,
     },
     /// connection 在该 segment 收到响应前已拆除（I/O 错误、peer 关闭、本地关闭等）。
     ///
-    /// sequence id 已随 connection 隔离，不会复用；调用方可以安全地通过新连接
-    /// 重发。每个被 [`CmppConnection::submit`] 接受的 sequence id 恰好会收到
-    /// `SubmitResp` / `SubmitTimeout` / `SubmitDropped` 三者之一。
+    /// sequence id 已随 connection 隔离，不会复用，但网关可能已受理，重发可能重复。
+    /// 消费者持续消费且未触发事件丢弃时，每个被 [`CmppConnection::submit`] 接受的
+    /// sequence id 恰好会收到 `SubmitResp` / `SubmitTimeout` / `SubmitDropped` 三者之一。
+    /// 背压超时、接收端关闭或拆连投递预算耗尽时允许丢失，缺失终态表示结果未知。
     SubmitDropped {
         /// 未收到响应的 SUBMIT 的 Sequence id。
         sequence_id: u32,
@@ -908,12 +913,11 @@ impl Inner {
 
     /// 丢弃所有 pending SUBMIT；其 owned permit 会随 entry 一同释放。
     ///
-    /// 拆连时对每个未终结的 sequence 发布 [`Event::SubmitDropped`]，保证调用方
-    /// 对每个已被 `submit()` 接受的 sequence id 都能拿到确定终态。这里刻意绕过
+    /// 拆连时为每个未终结的 sequence 尝试发布 [`Event::SubmitDropped`]。这里刻意绕过
     /// event admission 状态机：优雅关闭的 drain 会先 Sealed admission，而此时
-    /// pending SUBMIT 的终态仍必须送达消费者。事件按批打包成 spool item
+    /// pending SUBMIT 的终态仍需尝试投递。事件按批打包成 spool item
     /// （每批 [`SUBMIT_DROPPED_BATCH_SIZE`] 个），使 window=16384 的拆连也只占
-    /// ≤128 个 spool 槽，不会挤占留给 Terminal 的 emergency 容量；spool 暂满时
+    /// ≤128 个 spool 槽；已有事件仍可能占满 spool，因此暂满时
     /// 做有界退避重试（dispatcher 在背压后会进入 discard 模式快速排空），重试
     /// 耗尽仍失败的事件计入 `events_dropped` 并输出 warn 日志。
     async fn fail_all_pending(self: &Arc<Self>) {
@@ -1751,11 +1755,14 @@ impl CmppConnection {
     /// Submit message，并为每个 SMS segment 返回一个 sequence id。
     ///
     /// Non-blocking：调用只会在 sliding-window backpressure 时等待。同一重组域的
-    /// 8-bit UDH reference 全部占用时会立即返回 [`Error::Config`]。对应的
+    /// 8-bit UDH reference 全部占用（瞬态，受 cooldown 约束）时会立即返回
+    /// [`Error::ResourceExhausted`]（可退避重试）。对应的
     /// `SUBMIT_RESP` 会以 async 形式作为 [`Event::SubmitResp`]
     /// 到达（或到达 [`Event::SubmitTimeout`]；connection 提前拆除时为
     /// [`Event::SubmitDropped`]）。多 segment 长短信在发送中途因连接关闭失败时，
     /// 返回 [`Error::PartialSubmit`] 并携带已入队 segment 的 sequence id。
+    /// 消费者须持续读取事件；背压超时、接收端关闭或拆连投递预算耗尽可能丢失终态，
+    /// 此时未收到终态的 segment 结果未知，不能直接视为发送失败。
     /// 内容会自动 encode 并拆分（long SMS）。
     /// 当 `base_sequence_id` 为 `Some` 时，long SMS segment 会使用从该值开始的连续
     /// sequence id；否则由内部自动分配 sequence id。
@@ -1796,7 +1803,7 @@ impl CmppConnection {
             let lease = UDH_REFERENCE_POOL
                 .try_acquire(bucket_ids, preferred, self.inner.udh_reference_cooldown)
                 .ok_or_else(|| {
-                    Error::Config("同一短信重组域的 8-bit UDH reference 已全部占用".to_string())
+                    Error::ResourceExhausted("同一短信重组域的 8-bit UDH reference 已全部占用（受 cooldown 约束，稍后重试）".to_string())
                 })?;
             Some(lease)
         } else {
@@ -2329,6 +2336,9 @@ async fn event_dispatcher_task(
                 };
                 if !discard_events {
                     if let Err(error) = dispatch_event_with_budget(&events_tx, event).await {
+                        if let Some(inner) = inner.upgrade() {
+                            inner.events_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
                         discard_events = true;
                         match error {
                             EventDispatchError::Backpressure => {
@@ -2378,6 +2388,9 @@ async fn dispatch_direct_event(
         return;
     }
     if let Err(error) = dispatch_event_with_budget(events_tx, event).await {
+        if let Some(inner) = inner.upgrade() {
+            inner.events_dropped.fetch_add(1, Ordering::Relaxed);
+        }
         *discard_events = true;
         match error {
             EventDispatchError::Backpressure => {
@@ -3204,6 +3217,7 @@ async fn timeout_task(inner: Arc<Inner>, mut phase_rx: watch::Receiver<Connectio
                         // 扫描重试或由 fail_all_pending 兜底（与原 reserve 语义一致）。
                         if !inner.emit_event(Event::SubmitTimeout {
                             sequence_id: key.sequence_id,
+                            attempts: key.attempt,
                         }) {
                             None
                         } else {

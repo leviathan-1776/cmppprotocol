@@ -50,8 +50,11 @@ async fn main() -> cmppprotocol::Result<()> {
                             result
                         );
                     }
-                    Event::SubmitTimeout { sequence_id } => {
-                        println!("submit 超时 seq={}", sequence_id)
+                    Event::SubmitTimeout {
+                        sequence_id,
+                        attempts,
+                    } => {
+                        println!("submit 超时 seq={}（已尝试 {} 次）", sequence_id, attempts)
                     }
                     Event::SubmitDropped { sequence_id } => {
                         println!("submit 因连接断开未收到响应 seq={}", sequence_id)

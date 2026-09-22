@@ -51,7 +51,9 @@ async fn main() -> cmppprotocol::Result<()> {
                         println!("报告 {} -> {}", report.msg_id_hex(), report.stat);
                     }
                 }
-                Event::SubmitTimeout { sequence_id } => println!("超时 seq={}", sequence_id),
+                Event::SubmitTimeout { sequence_id, attempts } => {
+                    println!("超时 seq={}（已尝试 {} 次，可能重复下发）", sequence_id, attempts)
+                }
                 Event::SubmitDropped { sequence_id } => {
                     println!("连接断开，未收到响应 seq={}", sequence_id)
                 }
@@ -74,25 +76,36 @@ async fn main() -> cmppprotocol::Result<()> {
 
 ## 语义保证与运维注意事项
 
-- **终态完备性**：每个被 `submit()` 接受的 sequence id 恰好会收到一个终态事件——
+- **终态交付边界**：消费者持续消费且未触发事件丢弃时，每个被 `submit()` 接受的
+  sequence id 恰好会收到一个终态事件——
   `SubmitResp`（收到响应）、`SubmitTimeout`（重试预算耗尽）或 `SubmitDropped`
-  （连接在收到响应前被拆除）。调用方可以据此做精确对账与重发。
+  （连接在收到响应前被拆除）。背压超时、接收端关闭或拆连投递预算耗尽时允许丢失，
+  并计入 `events_dropped`。调用方须记录已接受的 seq；缺失终态表示“结果未知”，
+  不能直接视为发送失败重发。`SubmitDropped` 也不代表网关未受理。
 - **Disconnected 事件语义**：调用方主动 `close()` 的优雅关闭以事件通道结束
   （`recv()` 返回 `None`）表达，不发布 `Disconnected` 事件；`Disconnected`
   仅在异常拆除（I/O 错误、超时、对端 TERMINATE、事件积压有界关闭）时发布
   并携带原因。
 - **at-least-once 重传**：`SUBMIT_RESP` 丢失但 ISMG 实际已受理时，同 sequence id
   的重传可能导致网关侧重复计费/重复下发。业务侧应按 `msg_id` 做幂等。
+  `Event::SubmitTimeout` 携带完整写出次数 `attempts`（含首次：首次为 1，重传两次为 3），
+  写出不代表网关已接收，次数越大重复风险越高。
+- **错误可重试性**：`Error::is_retryable()` 区分瞬态失败（`Io`/`Timeout`/
+  `Closed`/`ResourceExhausted` 等，重连或退避后可重试）与持久失败（`Auth`/
+  `Decode`/`Config` 等，重试前需修正根因）。UDH 引用池耗尽属于
+  `ResourceExhausted`（瞬态，受 cooldown 约束）。可重试不代表重发安全或必然成功；
+  `PartialSubmit` 的未入队部分与已入队部分须分开处理。
 - **未确认 DELIVER**：`Event::Deliver` 仅在对应 `DELIVER_RESP` 已完整写到 socket 后
   才会发布。若连接在确认前异常拆除，该 DELIVER 会被丢弃且不会发布事件——
   多数 ISMG 会在重连后重推未确认的 DELIVER，依赖此行为的应用无需额外处理，
   不能依赖的应用应在 `Disconnected` 后自行容忍可能的重复。
 - **长短信部分提交**：多 segment 长短信逐段发送；若中途连接关闭，`submit()`
-  返回 `Error::PartialSubmit` 并携带已入队 segment 的 sequence id（它们会各自
-  收到终态事件），但终端不会重组出完整短信。调用方可据此精确重发缺失部分
+  返回 `Error::PartialSubmit` 并携带已入队 segment 的 sequence id（适用上述终态
+  交付边界），但终端不会重组出完整短信。调用方可据此重发未入队部分
   或整体重发（新连接 + 新 UDH reference）。
-- **事件消费必须常驻且快速**：event channel 的消费者停止读取超过 1 秒会触发
-  有界关闭（`Disconnected(ChannelClosed)`），这是防 OOM 设计。请把事件循环放在
+- **事件消费必须常驻且快速**：event channel 可用容量不足、持续阻塞投递超过配置预算（默认 1 秒）会触发
+  有界关闭（`Disconnected(ChannelClosed)`；若连接已因其他原因关闭则保留原原因），
+  后续事件进入丢弃模式；不保证整个关闭流程恰好在 1 秒内完成。请把事件循环放在
   独立 task 中持续消费。
 - **运行时 metrics**：`conn.metrics()` 返回 `ConnectionMetrics` 快照
   （admitted / responses / retries / timeouts / delivers / dropped events /

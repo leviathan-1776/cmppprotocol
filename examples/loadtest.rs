@@ -247,7 +247,7 @@ async fn main() {
                         shared.latencies.push(start.elapsed());
                     }
                 }
-                Event::SubmitTimeout { sequence_id } => {
+                Event::SubmitTimeout { sequence_id, .. } => {
                     shared.submitted.remove(&sequence_id);
                     shared.timeouts += 1;
                 }
@@ -306,7 +306,7 @@ async fn main() {
                     }
                     Err(e) => {
                         let mut shared = shared.lock().unwrap();
-                        if matches!(e, cmppprotocol::Error::Config(_)) {
+                        if matches!(e, cmppprotocol::Error::ResourceExhausted(_)) {
                             // UDH reference 池按 (src_id, dest) 分域，每域 256 个
                             // reference 释放后默认进入 300s cooldown——长短信持续
                             // 速率受此约束，这是防重组错误的刻意设计。
