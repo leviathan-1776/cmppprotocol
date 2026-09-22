@@ -2,6 +2,7 @@
 //!
 //! 用法：`cargo run --release --example loadtest -- [k=v ...]`
 //! 参数（默认值）：duration=10 window=64 delay_ms=50 parallel=8 dest_count=1 long=0
+//! 调优（默认值）：batch_frames=64 batch_bytes=65536 spool_capacity=256 event_timeout_ms=1000
 //!
 //! - `delay_ms` 模拟网关响应 RTT；稳态吞吐理论上限约为 `window / delay`。
 //! - `long=1` 发送 500 字中文长短信（8 段 UCS2）。
@@ -79,8 +80,7 @@ impl FrameReader {
     async fn next_frame(&mut self) -> std::io::Result<Option<(CmppHeader, Vec<u8>)>> {
         loop {
             if self.buf.len() >= 12 {
-                let total =
-                    u32::from_be_bytes(self.buf[..4].try_into().unwrap()) as usize;
+                let total = u32::from_be_bytes(self.buf[..4].try_into().unwrap()) as usize;
                 if (12..=65536).contains(&total) && self.buf.len() >= total {
                     let frame = self.buf.split_to(total).freeze();
                     let header = CmppHeader {
@@ -199,10 +199,18 @@ async fn main() {
     let parallel = arg_u64(&args, "parallel", 8) as usize;
     let dest_count = arg_u64(&args, "dest_count", 1) as usize;
     let long = arg_u64(&args, "long", 0) == 1;
+    let batch_frames = arg_u64(&args, "batch_frames", 64) as usize;
+    let batch_bytes = arg_u64(&args, "batch_bytes", 64 * 1024) as usize;
+    let spool_capacity = arg_u64(&args, "spool_capacity", 256) as usize;
+    let event_timeout_ms = arg_u64(&args, "event_timeout_ms", 1000);
 
     println!(
         "参数: duration={:?} window={} delay={:?} parallel={} dest_count={} long={}",
         duration, window, delay, parallel, dest_count, long
+    );
+    println!(
+        "调优: batch_frames={} batch_bytes={} spool_capacity={} event_timeout_ms={}",
+        batch_frames, batch_bytes, spool_capacity, event_timeout_ms
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -217,6 +225,10 @@ async fn main() {
         version: CMPP_VERSION_20,
         protocol_params: CmppProtocolParams {
             window_size: window,
+            write_batch_max_frames: batch_frames,
+            write_batch_max_bytes: batch_bytes,
+            event_spool_capacity: spool_capacity,
+            event_backpressure_timeout_ms: event_timeout_ms,
             ..CmppProtocolParams::default()
         },
     };
@@ -261,14 +273,14 @@ async fn main() {
         }
     });
 
-    let message = if long { "压".repeat(500) } else { "throughput".to_string() };
+    let message = if long {
+        "压".repeat(500)
+    } else {
+        "throughput".to_string()
+    };
     let opts = SubmitOptions::new("SVC", "901234", "10690001", "13800138000");
     let opts = if dest_count > 1 {
-        opts.dest_terminal_ids(
-            (0..dest_count)
-                .map(|i| format!("1380000{i:04}"))
-                .collect(),
-        )
+        opts.dest_terminal_ids((0..dest_count).map(|i| format!("1380000{i:04}")).collect())
     } else {
         opts
     };
@@ -333,7 +345,10 @@ async fn main() {
     loop {
         let (segments, finished) = {
             let shared = shared.lock().unwrap();
-            (shared.segments, shared.responses + shared.timeouts + shared.drops)
+            (
+                shared.segments,
+                shared.responses + shared.timeouts + shared.drops,
+            )
         };
         if finished >= segments || Instant::now() > drain_deadline {
             break;
@@ -402,5 +417,14 @@ async fn main() {
         metrics.submit_timeouts,
         metrics.events_dropped,
         metrics.submits_in_flight
+    );
+    let average_batch = if metrics.write_batches == 0 {
+        0.0
+    } else {
+        metrics.write_frames as f64 / metrics.write_batches as f64
+    };
+    println!(
+        "writer: batches={} frames={} average_batch={:.2} event_depth_peak={}",
+        metrics.write_batches, metrics.write_frames, average_batch, metrics.event_depth_peak
     );
 }

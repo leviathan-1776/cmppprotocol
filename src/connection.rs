@@ -32,34 +32,27 @@ use crate::codec::CmppFrameCodec;
 use crate::config::{CmppConfig, WINDOW_SIZE_ADVISORY_MAX};
 use crate::encoding::{SubmitContentPlan, prepare_submit_content};
 use crate::error::{Error, Result};
-use crate::pdu::{
-    Connect, Deliver, DeliverResp, Frame, Pdu, Submit, compute_authenticator_ismg,
-};
+use crate::pdu::{Connect, Deliver, DeliverResp, Frame, Pdu, Submit, compute_authenticator_ismg};
 use crate::submit::SubmitOptions;
 use crate::types::{
     CODEC_INITIAL_CAPACITY, INCOMING_CHANNEL_CAPACITY, SEND_CHANNEL_CAPACITY,
     TIMEOUT_CHECK_INTERVAL,
 };
 
-const EVENT_SPOOL_NORMAL_CAPACITY: usize = 256;
 const EVENT_SPOOL_EMERGENCY_CAPACITY: usize = 2;
-const EVENT_DISPATCH_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(1);
 // control 队列需要容纳 DELIVER_RESP/心跳响应/TERMINATE；给足余量，避免
 // 上行突发时 reader 因入队阻塞而停止读取 SUBMIT_RESP。
 const CONTROL_CHANNEL_CAPACITY: usize = 256;
 const CONTROL_BURST_LIMIT: usize = 16;
-// writer 单次批量写出的上限；超过任一阈值即 flush 当前批次（允许单帧少量超出）。
-const WRITE_BATCH_MAX_FRAMES: usize = 64;
-const WRITE_BATCH_MAX_BYTES: usize = 64 * 1024;
 const WRITE_BATCH_INITIAL_CAPACITY: usize = 4 * 1024;
 // reader 侧批量匹配 SUBMIT_RESP 的软上限：一次 read syscall 通常带回多个完整
 // 帧，超限即先 flush（单次写锁批量匹配），约束单次锁内工作量与缓冲内存。
 const SUBMIT_RESP_BATCH_MAX: usize = 256;
 // 拆连终态事件（SubmitDropped）每个 spool item 携带的数量上限：window=16384
-// 时也只占 ≤128 个 spool 槽（容量 258），避免挤占留给 Terminal 的 emergency 槽。
+// 时也只占 ≤128 个 spool 槽；实际普通容量至少覆盖这些批次，另留 emergency 槽。
 const SUBMIT_DROPPED_BATCH_SIZE: usize = 128;
 // fail_all_pending 对暂满 spool 的退避重试预算：dispatcher 背压后进入 discard
-// 模式会快速排空，预算内重试必然收敛；超预算则放弃并计数（有界内存契约）。
+// 模式会快速排空；超预算则放弃并计数（有界内存契约）。
 const TEARDOWN_EVENT_RETRY_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SUBMIT_RETRY_SPREAD_TICKS: usize = 4;
 const MAX_MANUAL_SEQUENCE_BATCHES: usize = 4;
@@ -146,6 +139,13 @@ pub struct ConnectionMetrics {
     pub submits_in_flight: usize,
     /// 配置的滑动窗口大小。
     pub window_size: usize,
+    /// writer 完整写出成功的批次数，不含建连握手，失败批次不计入。
+    pub write_batches: u64,
+    /// 上述成功批次的协议帧总数（含控制帧和重传）；除以 write_batches 得平均批大小。
+    pub write_frames: u64,
+    /// spool 工单持有的事件数峰值（含 dispatcher 当前工单和尝试入队的工单）。
+    /// 批量拆连按事件数计，Terminal 按 1 计，不含公开事件通道内的缓存。
+    pub event_depth_peak: usize,
 }
 
 enum EventSpoolItem {
@@ -173,25 +173,35 @@ enum EventSpoolItem {
     },
 }
 
+#[derive(Default)]
+struct EventDepth {
+    current: AtomicUsize,
+    peak: AtomicUsize,
+}
+
 struct EventDepthPermit {
-    depth: Arc<AtomicUsize>,
+    depth: Arc<EventDepth>,
     count: usize,
 }
 
 impl EventDepthPermit {
-    fn new(depth: Arc<AtomicUsize>) -> Self {
+    fn new(depth: Arc<EventDepth>) -> Self {
         Self::new_n(depth, 1)
     }
 
-    fn new_n(depth: Arc<AtomicUsize>, count: usize) -> Self {
-        depth.fetch_add(count, Ordering::SeqCst);
+    fn new_n(depth: Arc<EventDepth>, count: usize) -> Self {
+        let current = depth.current.fetch_add(count, Ordering::SeqCst) + count;
+        // 只有出现新峰值才做额外的原子读改写，减少稳定负载下的共享缓存竞争。
+        if current > depth.peak.load(Ordering::Relaxed) {
+            depth.peak.fetch_max(current, Ordering::Relaxed);
+        }
         EventDepthPermit { depth, count }
     }
 }
 
 impl Drop for EventDepthPermit {
     fn drop(&mut self) {
-        self.depth.fetch_sub(self.count, Ordering::SeqCst);
+        self.depth.current.fetch_sub(self.count, Ordering::SeqCst);
     }
 }
 
@@ -288,8 +298,10 @@ impl UdhReferencePool {
         let mut ids = bucket_ids.into_vec();
         ids.sort_unstable();
         ids.dedup();
-        let mut guards: Vec<PkMutexGuard<'_, UdhReferenceBucket>> =
-            ids.iter().map(|&bucket_id| self.buckets[bucket_id].lock()).collect();
+        let mut guards: Vec<PkMutexGuard<'_, UdhReferenceBucket>> = ids
+            .iter()
+            .map(|&bucket_id| self.buckets[bucket_id].lock())
+            .collect();
         for guard in guards.iter_mut() {
             purge_udh_cooldowns(guard, now);
         }
@@ -795,7 +807,8 @@ struct Inner {
     control_tx: mpsc::Sender<Outbound>,
     event_spool_tx: mpsc::Sender<EventSpoolItem>,
     event_admission: StdMutex<EventAdmissionState>,
-    event_depth: Arc<AtomicUsize>,
+    event_depth: Arc<EventDepth>,
+    event_spool_capacity: usize,
     event_tickets: Arc<EventTicketTracker>,
     event_overflowed: AtomicBool,
     unexpected_pdu_log_at: AtomicU64,
@@ -814,6 +827,8 @@ struct Inner {
     delivers_received: AtomicU64,
     events_dropped: AtomicU64,
     unexpected_pdus: AtomicU64,
+    write_batches: AtomicU64,
+    write_frames: AtomicU64,
     phase: AtomicU8,
     phase_tx: watch::Sender<ConnectionPhase>,
     external_handles: AtomicUsize,
@@ -833,6 +848,8 @@ struct Inner {
     retry_count: u32,
     window_size: usize,
     submit_retry_batch_size: usize,
+    write_batch_max_frames: usize,
+    write_batch_max_bytes: usize,
 }
 
 impl Inner {
@@ -857,6 +874,9 @@ impl Inner {
                 .window_size
                 .saturating_sub(self.window_semaphore.available_permits()),
             window_size: self.window_size,
+            write_batches: self.write_batches.load(Ordering::Relaxed),
+            write_frames: self.write_frames.load(Ordering::Relaxed),
+            event_depth_peak: self.event_depth.peak.load(Ordering::Relaxed),
         }
     }
 
@@ -926,7 +946,10 @@ impl Inner {
             if pending.is_empty() {
                 return;
             }
-            pending.drain().map(|(sequence_id, _)| sequence_id).collect()
+            pending
+                .drain()
+                .map(|(sequence_id, _)| sequence_id)
+                .collect()
         };
         let retry_deadline = Instant::now() + TEARDOWN_EVENT_RETRY_BUDGET;
         let mut backoff = Duration::from_millis(1);
@@ -959,7 +982,8 @@ impl Inner {
                 }
             }
             if !delivered {
-                self.events_dropped.fetch_add(count as u64, Ordering::Relaxed);
+                self.events_dropped
+                    .fetch_add(count as u64, Ordering::Relaxed);
                 if spool_closed {
                     // dispatcher 已退出，当前及后续批次的终态事件都无法送达。
                     let remaining: usize = dropped
@@ -989,7 +1013,10 @@ impl Inner {
     /// （begin_closing / transition_to_closed）同样需要该锁，因此批内 phase
     /// 判定与逐帧领取时完全一致。领取后必须完整写完该 frame，避免半包。
     fn claim_submit_attempts(&self, batch: &mut Vec<Outbound>) {
-        if !batch.iter().any(|outbound| outbound.submit_attempt.is_some()) {
+        if !batch
+            .iter()
+            .any(|outbound| outbound.submit_attempt.is_some())
+        {
             return;
         }
         let mut skipped: Vec<(u32, u32)> = Vec::new();
@@ -1061,28 +1088,26 @@ impl Inner {
         }
         let mut pending = self.pending_submits.write();
         for key in keys {
-            let should_remove = pending
-                .get_mut(&key.sequence_id)
-                .is_some_and(|entry| {
-                    if entry.submission_id != key.submission_id {
-                        return false;
+            let should_remove = pending.get_mut(&key.sequence_id).is_some_and(|entry| {
+                if entry.submission_id != key.submission_id {
+                    return false;
+                }
+                match entry.state {
+                    SubmitAttemptState::Writing { attempt } if attempt == key.attempt => {
+                        entry.state = SubmitAttemptState::AwaitingResponse {
+                            attempt: key.attempt,
+                            written_at,
+                        };
+                        false
                     }
-                    match entry.state {
-                        SubmitAttemptState::Writing { attempt } if attempt == key.attempt => {
-                            entry.state = SubmitAttemptState::AwaitingResponse {
-                                attempt: key.attempt,
-                                written_at,
-                            };
-                            false
-                        }
-                        SubmitAttemptState::RespondedWhileWriting { attempt }
-                            if attempt == key.attempt =>
-                        {
-                            true
-                        }
-                        _ => false,
+                    SubmitAttemptState::RespondedWhileWriting { attempt }
+                        if attempt == key.attempt =>
+                    {
+                        true
                     }
-                });
+                    _ => false,
+                }
+            });
             if should_remove {
                 pending.remove(&key.sequence_id);
             }
@@ -1169,7 +1194,7 @@ impl Inner {
                 }
                 EventAdmissionState::Overflowed => Err(EventReservationError::Overflowed),
                 EventAdmissionState::Open | EventAdmissionState::Draining => {
-                    if self.event_depth.load(Ordering::SeqCst) < EVENT_SPOOL_NORMAL_CAPACITY {
+                    if self.event_depth.current.load(Ordering::SeqCst) < self.event_spool_capacity {
                         match self.make_event_ticket() {
                             Ok(ticket) => Ok(ticket),
                             Err(()) => {
@@ -1211,11 +1236,14 @@ impl Inner {
                 EventAdmissionState::Terminal | EventAdmissionState::Sealed => false,
                 EventAdmissionState::Overflowed => false,
                 EventAdmissionState::Open | EventAdmissionState::Draining => {
+                    // 与 Deferred 一致，在为当前事件计入深度前检查普通容量。
+                    let has_capacity =
+                        self.event_depth.current.load(Ordering::SeqCst) < self.event_spool_capacity;
                     let item = EventSpoolItem::Direct {
                         event,
                         _depth_permit: EventDepthPermit::new(self.event_depth.clone()),
                     };
-                    if self.event_depth.load(Ordering::SeqCst) < EVENT_SPOOL_NORMAL_CAPACITY {
+                    if has_capacity {
                         match self.event_spool_tx.try_send(item) {
                             Ok(()) => true,
                             Err(_) => {
@@ -1284,7 +1312,7 @@ impl Inner {
     fn start_event_overload_close(self: &Arc<Self>) {
         log::error!(
             "CMPP event backlog/backpressure 已达到上限 {}，正在有界关闭 connection",
-            EVENT_SPOOL_NORMAL_CAPACITY
+            self.event_spool_capacity
         );
         if !self.begin_closing(false) {
             return;
@@ -1618,16 +1646,18 @@ impl CmppConnection {
             .min(window_size);
         let (submit_tx, submit_rx) = mpsc::channel::<Outbound>(SEND_CHANNEL_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel::<Outbound>(CONTROL_CHANNEL_CAPACITY);
-        let (event_spool_tx, event_spool_rx) = mpsc::channel::<EventSpoolItem>(
-            EVENT_SPOOL_NORMAL_CAPACITY + EVENT_SPOOL_EMERGENCY_CAPACITY,
-        );
+        let event_spool_capacity = params
+            .event_spool_capacity
+            .max(window_size.div_ceil(SUBMIT_DROPPED_BATCH_SIZE));
+        let (event_spool_tx, event_spool_rx) =
+            mpsc::channel::<EventSpoolItem>(event_spool_capacity + EVENT_SPOOL_EMERGENCY_CAPACITY);
         let (events_tx, events_rx) = mpsc::channel::<Event>(INCOMING_CHANNEL_CAPACITY);
         let (phase_tx, _) = watch::channel(ConnectionPhase::Open);
         let (close_complete_tx, _) = watch::channel(false);
         let (cleanup_complete_tx, _) = watch::channel(false);
         let (workers_complete_tx, _) = watch::channel(false);
         let (event_tickets_pending_tx, _) = watch::channel(0usize);
-        let event_depth = Arc::new(AtomicUsize::new(0));
+        let event_depth = Arc::new(EventDepth::default());
         let event_tickets = Arc::new(EventTicketTracker {
             pending_tx: event_tickets_pending_tx,
         });
@@ -1641,6 +1671,7 @@ impl CmppConnection {
             event_spool_tx,
             event_admission: StdMutex::new(EventAdmissionState::Open),
             event_depth,
+            event_spool_capacity,
             event_tickets,
             event_overflowed: AtomicBool::new(false),
             unexpected_pdu_log_at: AtomicU64::new(u64::MAX),
@@ -1660,6 +1691,8 @@ impl CmppConnection {
             delivers_received: AtomicU64::new(0),
             events_dropped: AtomicU64::new(0),
             unexpected_pdus: AtomicU64::new(0),
+            write_batches: AtomicU64::new(0),
+            write_frames: AtomicU64::new(0),
             phase: AtomicU8::new(ConnectionPhase::Open as u8),
             phase_tx,
             external_handles: AtomicUsize::new(1),
@@ -1679,6 +1712,8 @@ impl CmppConnection {
             retry_count: params.retry_count,
             window_size,
             submit_retry_batch_size,
+            write_batch_max_frames: params.write_batch_max_frames,
+            write_batch_max_bytes: params.write_batch_max_bytes,
         });
 
         let framed_parts = framed.into_parts();
@@ -1690,6 +1725,7 @@ impl CmppConnection {
             event_spool_rx,
             events_tx,
             Arc::downgrade(&inner),
+            Duration::from_millis(params.event_backpressure_timeout_ms),
         ));
         drop(dispatcher_handle);
 
@@ -1803,7 +1839,10 @@ impl CmppConnection {
             let lease = UDH_REFERENCE_POOL
                 .try_acquire(bucket_ids, preferred, self.inner.udh_reference_cooldown)
                 .ok_or_else(|| {
-                    Error::ResourceExhausted("同一短信重组域的 8-bit UDH reference 已全部占用（受 cooldown 约束，稍后重试）".to_string())
+                    Error::ResourceExhausted(
+                        "同一短信重组域的 8-bit UDH reference 已全部占用（受 cooldown 约束，稍后重试）"
+                            .to_string(),
+                    )
                 })?;
             Some(lease)
         } else {
@@ -2189,20 +2228,26 @@ async fn setup_tcp(config: &CmppConfig) -> Result<TcpStream> {
         })?
         .map_err(|e| Error::Connect(format!("连接到 {} 失败: {}", addr, e)))?;
 
-    if let Err(e) = stream.set_nodelay(true) {
+    if let Err(e) = stream.set_nodelay(config.protocol_params.tcp_nodelay) {
         log::warn!("设置 TCP_NODELAY 失败: {}（继续运行）", e);
     }
-    configure_keepalive(&stream, Duration::from_secs(60));
+    configure_keepalive(&stream, &config.protocol_params);
     log::info!("TCP 已连接: {}", addr);
     Ok(stream)
 }
 
 /// 通过 `socket2` 实现跨平台 TCP keepalive。
-fn configure_keepalive(stream: &TcpStream, idle: Duration) {
+fn configure_keepalive(stream: &TcpStream, params: &crate::config::CmppProtocolParams) {
     let sock = socket2::SockRef::from(stream);
+    let Some(idle) = params.tcp_keepalive_secs else {
+        if let Err(e) = sock.set_keepalive(false) {
+            log::warn!("禁用 TCP keepalive 失败: {}（继续运行）", e);
+        }
+        return;
+    };
     let ka = socket2::TcpKeepalive::new()
-        .with_time(idle)
-        .with_interval(Duration::from_secs(10));
+        .with_time(Duration::from_secs(idle))
+        .with_interval(Duration::from_secs(params.tcp_keepalive_interval_secs));
     if let Err(e) = sock.set_tcp_keepalive(&ka) {
         log::warn!("设置 TCP keepalive 失败: {}（继续运行）", e);
     }
@@ -2295,6 +2340,7 @@ async fn event_dispatcher_task(
     mut event_spool_rx: mpsc::Receiver<EventSpoolItem>,
     events_tx: mpsc::Sender<Event>,
     inner: Weak<Inner>,
+    backpressure_timeout: Duration,
 ) {
     let mut discard_events = false;
 
@@ -2304,14 +2350,28 @@ async fn event_dispatcher_task(
                 event,
                 _depth_permit,
             } => {
-                dispatch_direct_event(&events_tx, &inner, &mut discard_events, event).await;
+                dispatch_direct_event(
+                    &events_tx,
+                    &inner,
+                    &mut discard_events,
+                    event,
+                    backpressure_timeout,
+                )
+                .await;
             }
             EventSpoolItem::Batch {
                 events,
                 _depth_permit,
             } => {
                 for event in events {
-                    dispatch_direct_event(&events_tx, &inner, &mut discard_events, event).await;
+                    dispatch_direct_event(
+                        &events_tx,
+                        &inner,
+                        &mut discard_events,
+                        event,
+                        backpressure_timeout,
+                    )
+                    .await;
                 }
             }
             EventSpoolItem::Event {
@@ -2335,7 +2395,9 @@ async fn event_dispatcher_task(
                     }
                 };
                 if !discard_events {
-                    if let Err(error) = dispatch_event_with_budget(&events_tx, event).await {
+                    if let Err(error) =
+                        dispatch_event_with_budget(&events_tx, event, backpressure_timeout).await
+                    {
                         if let Some(inner) = inner.upgrade() {
                             inner.events_dropped.fetch_add(1, Ordering::Relaxed);
                         }
@@ -2344,7 +2406,7 @@ async fn event_dispatcher_task(
                             EventDispatchError::Backpressure => {
                                 log::warn!(
                                     "event receiver 背压超过 {:?}，正在关闭 connection 并有界排空",
-                                    EVENT_DISPATCH_BACKPRESSURE_TIMEOUT
+                                    backpressure_timeout
                                 );
                                 if let Some(inner) = inner.upgrade() {
                                     inner.start_event_dispatch_backpressure_close();
@@ -2380,6 +2442,7 @@ async fn dispatch_direct_event(
     inner: &Weak<Inner>,
     discard_events: &mut bool,
     event: Event,
+    backpressure_timeout: Duration,
 ) {
     if *discard_events {
         if let Some(inner) = inner.upgrade() {
@@ -2387,7 +2450,7 @@ async fn dispatch_direct_event(
         }
         return;
     }
-    if let Err(error) = dispatch_event_with_budget(events_tx, event).await {
+    if let Err(error) = dispatch_event_with_budget(events_tx, event, backpressure_timeout).await {
         if let Some(inner) = inner.upgrade() {
             inner.events_dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -2396,7 +2459,7 @@ async fn dispatch_direct_event(
             EventDispatchError::Backpressure => {
                 log::warn!(
                     "event receiver 背压超过 {:?}，正在关闭 connection 并有界排空",
-                    EVENT_DISPATCH_BACKPRESSURE_TIMEOUT
+                    backpressure_timeout
                 );
                 if let Some(inner) = inner.upgrade() {
                     inner.start_event_dispatch_backpressure_close();
@@ -2422,14 +2485,12 @@ enum EventDispatchError {
 async fn dispatch_event_with_budget(
     events_tx: &mpsc::Sender<Event>,
     event: Event,
+    backpressure_timeout: Duration,
 ) -> std::result::Result<(), EventDispatchError> {
-    let mut permits = tokio::time::timeout(
-        EVENT_DISPATCH_BACKPRESSURE_TIMEOUT,
-        events_tx.reserve_many(2),
-    )
-    .await
-    .map_err(|_| EventDispatchError::Backpressure)?
-    .map_err(|_| EventDispatchError::Closed)?;
+    let mut permits = tokio::time::timeout(backpressure_timeout, events_tx.reserve_many(2))
+        .await
+        .map_err(|_| EventDispatchError::Backpressure)?
+        .map_err(|_| EventDispatchError::Closed)?;
     let permit = permits.next().ok_or(EventDispatchError::Closed)?;
     permit.send(event);
     Ok(())
@@ -2451,9 +2512,9 @@ async fn writer_task(
 ) {
     let mut control_burst = 0usize;
     let mut batch_buf = BytesMut::with_capacity(WRITE_BATCH_INITIAL_CAPACITY);
-    let mut batch: Vec<Outbound> = Vec::with_capacity(WRITE_BATCH_MAX_FRAMES);
+    let mut batch: Vec<Outbound> = Vec::with_capacity(inner.write_batch_max_frames);
     // 复用的批量 complete 缓冲：收集批内 SUBMIT attempt key，单次写锁完成转移。
-    let mut complete_keys: Vec<SubmitAttemptKey> = Vec::with_capacity(WRITE_BATCH_MAX_FRAMES);
+    let mut complete_keys: Vec<SubmitAttemptKey> = Vec::with_capacity(inner.write_batch_max_frames);
     'outer: loop {
         let phase = inner.phase();
         if phase == ConnectionPhase::Closed {
@@ -2518,8 +2579,8 @@ async fn writer_task(
             let (outbound, is_submit) = match cursor.take() {
                 Some(pair) => pair,
                 None => {
-                    if batch.len() >= WRITE_BATCH_MAX_FRAMES
-                        || batch_bytes >= WRITE_BATCH_MAX_BYTES
+                    if batch.len() >= inner.write_batch_max_frames
+                        || batch_bytes >= inner.write_batch_max_bytes
                     {
                         break;
                     }
@@ -2540,9 +2601,7 @@ async fn writer_task(
                             .try_recv()
                             .ok()
                             .map(|outbound| (outbound, false))
-                            .or_else(|| {
-                                submit_rx.try_recv().ok().map(|outbound| (outbound, true))
-                            })
+                            .or_else(|| submit_rx.try_recv().ok().map(|outbound| (outbound, true)))
                     } else {
                         control_rx.try_recv().ok().map(|outbound| (outbound, false))
                     };
@@ -2659,6 +2718,10 @@ async fn writer_task(
         match write_result {
             Ok(()) => {
                 let written_at = Instant::now();
+                inner.write_batches.fetch_add(1, Ordering::Relaxed);
+                inner
+                    .write_frames
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 // 单次写锁批量完成整批 SUBMIT attempt 的 Writing→AwaitingResponse
                 // 转移（或写入期间已响应时移除条目）。
                 complete_keys.clear();
@@ -2947,8 +3010,7 @@ fn flush_submit_resps(inner: &Arc<Inner>, pending_resps: &mut Vec<(u32, [u8; 8],
                 }
                 Some(SubmitAttemptState::RespondedWhileWriting { .. }) => false,
                 Some(
-                    SubmitAttemptState::Queued { .. }
-                    | SubmitAttemptState::AwaitingResponse { .. },
+                    SubmitAttemptState::Queued { .. } | SubmitAttemptState::AwaitingResponse { .. },
                 ) => {
                     map.remove(&sequence_id);
                     true
@@ -3344,5 +3406,78 @@ fn log_submit_timeout_batch(count: usize, samples: &[u32]) {
             count,
             samples
         );
+    }
+}
+
+#[cfg(test)]
+mod performance_config_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tcp_options_are_applied_to_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        for enabled in [false, true] {
+            let config = CmppConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port() as i32,
+                account: "901234".into(),
+                password: "test".into(),
+                version: crate::CMPP_VERSION_20,
+                protocol_params: crate::config::CmppProtocolParams {
+                    tcp_nodelay: enabled,
+                    tcp_keepalive_secs: enabled.then_some(60),
+                    ..crate::config::CmppProtocolParams::default()
+                },
+            };
+            let stream = setup_tcp(&config).await.unwrap();
+            let (_peer, _) = listener.accept().await.unwrap();
+            assert_eq!(stream.nodelay().unwrap(), enabled);
+            assert_eq!(
+                socket2::SockRef::from(&stream).keepalive().unwrap(),
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn event_depth_counts_batches_and_preserves_peak_after_release() {
+        let depth = Arc::new(EventDepth::default());
+        let batch = EventDepthPermit::new_n(depth.clone(), 128);
+        let terminal = EventDepthPermit::new(depth.clone());
+        assert_eq!(depth.current.load(Ordering::SeqCst), 129);
+        assert_eq!(depth.peak.load(Ordering::Relaxed), 129);
+        drop(batch);
+        assert_eq!(depth.current.load(Ordering::SeqCst), 1);
+        drop(terminal);
+        assert_eq!(depth.current.load(Ordering::SeqCst), 0);
+        assert_eq!(depth.peak.load(Ordering::Relaxed), 129);
+    }
+
+    #[tokio::test]
+    async fn configured_backpressure_budget_preserves_terminal_slot() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let budget = Duration::from_millis(10);
+        assert!(
+            dispatch_event_with_budget(&tx, Event::SubmitDropped { sequence_id: 1 }, budget)
+                .await
+                .is_ok()
+        );
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            dispatch_event_with_budget(&tx, Event::SubmitDropped { sequence_id: 2 }, budget),
+        )
+        .await
+        .expect("应采用 10ms 配置，不能仍等待默认 1 秒");
+        assert!(matches!(result, Err(EventDispatchError::Backpressure)));
+        assert!(
+            tx.try_send(Event::Disconnected(Error::ChannelClosed))
+                .is_ok()
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(Event::SubmitDropped { sequence_id: 1 })
+        ));
+        assert!(matches!(rx.recv().await, Some(Event::Disconnected(_))));
     }
 }

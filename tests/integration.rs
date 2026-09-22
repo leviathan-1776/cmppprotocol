@@ -189,6 +189,26 @@ async fn connect_submit_and_receive_report() {
 
 #[tokio::test]
 async fn pipelined_submits_all_receive_responses() {
+    verify_pipelined_submits(CmppProtocolParams::default()).await;
+}
+
+#[tokio::test]
+async fn configured_writer_limits_preserve_frames_and_metrics() {
+    for (frames, bytes) in [(1, 65536), (64, 1)] {
+        verify_pipelined_submits(CmppProtocolParams {
+            write_batch_max_frames: frames,
+            write_batch_max_bytes: bytes,
+            tcp_nodelay: false,
+            tcp_keepalive_secs: None,
+            ..CmppProtocolParams::default()
+        })
+        .await;
+    }
+}
+
+async fn verify_pipelined_submits(params: CmppProtocolParams) {
+    let single_frame_batches =
+        params.write_batch_max_frames == 1 || params.write_batch_max_bytes == 1;
     // 一次性入队 10 条消息，服务端按序读取
     // 10 个 SUBMIT 并逐条回复，验证批量写出不破坏帧顺序与 sequence 关联。
     const N: usize = 10;
@@ -233,7 +253,7 @@ async fn pipelined_submits_all_receive_responses() {
         account: "901234".into(),
         password: SECRET.into(),
         version: cmppprotocol::CMPP_VERSION_20,
-        protocol_params: CmppProtocolParams::default(),
+        protocol_params: params,
     };
 
     let conn = CmppConnection::connect(config)
@@ -274,6 +294,12 @@ async fn pipelined_submits_all_receive_responses() {
     let metrics = conn.metrics();
     assert_eq!(metrics.submit_responses, N as u64);
     assert_eq!(metrics.submits_in_flight, 0);
+    assert!(metrics.write_frames >= N as u64);
+    assert!(metrics.write_batches > 0);
+    assert!(metrics.event_depth_peak > 0);
+    if single_frame_batches {
+        assert_eq!(metrics.write_frames, metrics.write_batches);
+    }
 
     conn.close().await;
     let _ = server.await;
