@@ -167,6 +167,10 @@ cargo run --release --example loadtest -- duration=6 long=1 udh_cooldown_ms=500
 cargo run --release --example loadtest -- duration=6 window=256 delay_ms=0 parallel=8 batch_frames=64 batch_bytes=65536 spool_capacity=256 event_timeout_ms=1000
 ```
 
+新增多连接、DELIVER、分配统计及 Windows CPU 测量脚本，见
+[扩展测量报告](docs/performance-matrix-2026-09-27.md)。当前模拟网关默认开启 TCP_NODELAY，
+可用 `server_nodelay=0` 复现旧网关配置；CPU/分配统计包含进程内网关与压测程序。
+
 历史实测参考（Windows，单连接；不代表本轮改动已取得相同吞吐或提升）：
 
 | 场景 | 实测吞吐 | 说明 |

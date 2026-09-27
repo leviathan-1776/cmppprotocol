@@ -2,6 +2,8 @@
 //!
 //! 用法：`cargo run --release --example loadtest -- [k=v ...]`
 //! 参数（默认值）：duration=10 window=64 delay_ms=50 parallel=8 dest_count=1 long=0
+//! 扩展：connections=1 deliver_window=0 alloc=0 server_nodelay=1；parallel=0 可仅压 DELIVER。
+//! alloc=1 统计整个进程的成功分配/重分配请求，含网关与统计器，必须与吞吐轮次分开。
 //! 调优（默认值）：batch_frames=64 batch_bytes=65536 spool_capacity=256 event_timeout_ms=1000
 //!
 //! - `delay_ms` 模拟网关响应 RTT；稳态吞吐理论上限约为 `window / delay`。
@@ -10,22 +12,25 @@
 //! - `udh_cooldown_ms` 覆盖长短信 UDH reference 的 cooldown（默认 300s）。
 //!
 //! 注意：事件消费者必须跟上响应速率，否则会触发连接的有界关闭
-//! （`dropped_events` > 0），此时测得的是消费者背压而不是协议吞吐。
+//! 提前关闭的轮次不能视为稳态吞吐；events_dropped=0 也不表示连接未提前关闭。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
-use cmppprotocol::pdu::{ConnectResp, SubmitResp, compute_authenticator_ismg};
+use cmppprotocol::pdu::{ConnectResp, Deliver, SubmitResp, compute_authenticator_ismg};
 use cmppprotocol::{
-    CMPP_ACTIVE_TEST, CMPP_SUBMIT, CMPP_TERMINATE, CMPP_VERSION_20, CmppConfig, CmppConnection,
-    CmppHeader, CmppProtocolParams, Event, Pdu, SubmitOptions,
+    CMPP_ACTIVE_TEST, CMPP_DELIVER_RESP, CMPP_SUBMIT, CMPP_TERMINATE, CMPP_VERSION_20, CmppConfig,
+    CmppConnection, CmppHeader, CmppProtocolParams, Event, Pdu, SubmitOptions,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Barrier, Mutex as AsyncMutex};
+
+#[path = "support/allocation_meter.rs"]
+mod allocation_meter;
 
 const SECRET: &str = "secret";
 
@@ -36,6 +41,7 @@ struct Shared {
     responses: u64,
     timeouts: u64,
     drops: u64,
+    delivers: u64,
     max_submit_block: Duration,
     /// 连接提前关闭的时刻（None = 全程存活）。
     closed_at: Option<Duration>,
@@ -44,6 +50,7 @@ struct Shared {
     /// sequence id -> 入队时刻（延迟采样：仅记录 1/64 的 submit 批次）。
     submitted: HashMap<u32, Instant>,
     latencies: Vec<Duration>,
+    deliver_latencies: Vec<Duration>,
 }
 
 fn parse_args() -> HashMap<String, String> {
@@ -107,17 +114,47 @@ impl FrameReader {
     }
 }
 
-/// 进程内 mock ISMG：完成登录后，对每个 SUBMIT 回复 SUBMIT_RESP。
-/// `delay` 为零时在同一循环内联回复（最小化 harness 开销）；
-/// 否则每个 SUBMIT spawn 一个延迟响应 task（模拟并发 RTT）。
-async fn mock_ismg(listener: TcpListener, delay: Duration) {
+/// 所有连接和网关完成握手后一起开始计时。
+struct RunGate {
+    ready: Barrier,
+    go: Barrier,
+    start: OnceLock<Instant>,
+    duration: Duration,
+}
+
+impl RunGate {
+    async fn wait(&self) -> Instant {
+        self.ready.wait().await;
+        self.go.wait().await;
+        *self.start.get().unwrap()
+    }
+}
+
+#[derive(Default)]
+struct GatewayStats {
+    deliver_sent: u64,
+    deliver_acked: u64,
+}
+
+/// 进程内网关；非零 delay 通过每个 SUBMIT 一个延迟 task 模拟并发 RTT。
+async fn mock_ismg(
+    listener: TcpListener,
+    delay: Duration,
+    deliver_window: usize,
+    gate: Arc<RunGate>,
+    deliver_drained: Arc<tokio::sync::Notify>,
+    server_nodelay: bool,
+) -> GatewayStats {
     let (stream, _) = listener.accept().await.expect("accept");
+    stream
+        .set_nodelay(server_nodelay)
+        .expect("mock TCP_NODELAY");
     let (read_half, write_half) = stream.into_split();
     let writer = Arc::new(AsyncMutex::new(write_half));
     let mut reader = FrameReader::new(read_half);
 
     let Some((header, body)) = reader.next_frame().await.expect("读 CONNECT") else {
-        return;
+        return GatewayStats::default();
     };
     let connect = match Pdu::decode(header, &body).expect("decode CONNECT") {
         Pdu::Connect(c) => c,
@@ -136,7 +173,35 @@ async fn mock_ismg(listener: TcpListener, delay: Duration) {
         .await
         .expect("写 CONNECT_RESP");
 
-    while let Ok(Some((header, _body))) = reader.next_frame().await {
+    let started = gate.wait().await;
+    let deadline = started + gate.duration;
+    let mut deliver = Deliver {
+        msg_id: [7; 8],
+        dest_id: "10690001".into(),
+        service_id: "SVC".into(),
+        tp_pid: 0,
+        tp_udhi: 0,
+        msg_fmt: 0,
+        src_terminal_id: "13800138000".into(),
+        registered_delivery: 0,
+        msg_content: vec![b'x'; 100],
+    };
+    let mut stats = GatewayStats::default();
+    let mut next_deliver = 1u32;
+    let mut pending = std::collections::HashSet::new();
+    for _ in 0..deliver_window {
+        deliver.msg_id = (started.elapsed().as_nanos() as u64).to_be_bytes();
+        writer
+            .lock()
+            .await
+            .write_all(&Pdu::Deliver(deliver.clone()).encode(next_deliver))
+            .await
+            .expect("DELIVER write");
+        pending.insert(next_deliver);
+        next_deliver += 1;
+        stats.deliver_sent += 1;
+    }
+    'read: while let Ok(Some((header, _body))) = reader.next_frame().await {
         match header.command_id {
             CMPP_SUBMIT => {
                 let respond = |writer: Arc<AsyncMutex<OwnedWriteHalf>>, sequence_id: u32| async move {
@@ -161,6 +226,30 @@ async fn mock_ismg(listener: TcpListener, delay: Duration) {
                     });
                 }
             }
+            CMPP_DELIVER_RESP => {
+                assert!(
+                    pending.remove(&header.sequence_id),
+                    "duplicate/unknown DELIVER_RESP"
+                );
+                stats.deliver_acked += 1;
+                if Instant::now() < deadline {
+                    deliver.msg_id = (started.elapsed().as_nanos() as u64).to_be_bytes();
+                    if writer
+                        .lock()
+                        .await
+                        .write_all(&Pdu::Deliver(deliver.clone()).encode(next_deliver))
+                        .await
+                        .is_err()
+                    {
+                        break 'read;
+                    }
+                    pending.insert(next_deliver);
+                    next_deliver = next_deliver.wrapping_add(1);
+                    stats.deliver_sent += 1;
+                } else if pending.is_empty() {
+                    deliver_drained.notify_one();
+                }
+            }
             CMPP_ACTIVE_TEST => {
                 let _ = writer
                     .lock()
@@ -179,6 +268,8 @@ async fn mock_ismg(listener: TcpListener, delay: Duration) {
             _ => {}
         }
     }
+    deliver_drained.notify_one();
+    stats
 }
 
 /// 输入必须已排序。
@@ -190,14 +281,18 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
     sorted[index]
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
-    let args = parse_args();
+async fn run_connection(
+    args: HashMap<String, String>,
+    gate: Arc<RunGate>,
+    index: usize,
+) -> (Shared, cmppprotocol::ConnectionMetrics, GatewayStats) {
     let duration = Duration::from_secs(arg_u64(&args, "duration", 10));
     let window = arg_u64(&args, "window", 64) as usize;
     let delay = Duration::from_millis(arg_u64(&args, "delay_ms", 50));
     let parallel = arg_u64(&args, "parallel", 8) as usize;
     let dest_count = arg_u64(&args, "dest_count", 1) as usize;
+    let deliver_window = arg_u64(&args, "deliver_window", 0) as usize;
+    assert!(duration.as_secs() > 0 && (parallel > 0 || deliver_window > 0));
     let long = arg_u64(&args, "long", 0) == 1;
     let batch_frames = arg_u64(&args, "batch_frames", 64) as usize;
     let batch_bytes = arg_u64(&args, "batch_bytes", 64 * 1024) as usize;
@@ -215,7 +310,15 @@ async fn main() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(mock_ismg(listener, delay));
+    let deliver_drained = Arc::new(tokio::sync::Notify::new());
+    let server = tokio::spawn(mock_ismg(
+        listener,
+        delay,
+        deliver_window,
+        gate.clone(),
+        deliver_drained.clone(),
+        arg_u64(&args, "server_nodelay", 1) == 1,
+    ));
 
     let config = CmppConfig {
         host: "127.0.0.1".into(),
@@ -247,6 +350,7 @@ async fn main() {
     let shared = Arc::new(Mutex::new(Shared::default()));
 
     let event_shared = shared.clone();
+    let event_gate = gate.clone();
     let event_task = tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             let mut shared = event_shared.lock().unwrap();
@@ -267,8 +371,22 @@ async fn main() {
                     shared.submitted.remove(&sequence_id);
                     shared.drops += 1;
                 }
-                Event::Deliver(_) => {}
-                Event::Disconnected(_) => break,
+                Event::Deliver(deliver) => {
+                    shared.delivers += 1;
+                    if shared.delivers % 64 == 0 {
+                        let elapsed = event_gate.start.get().unwrap().elapsed();
+                        shared.deliver_latencies.push(elapsed.saturating_sub(
+                            Duration::from_nanos(u64::from_be_bytes(deliver.msg_id)),
+                        ));
+                    }
+                }
+                Event::Disconnected(reason) => {
+                    eprintln!("connection={index} disconnected: {reason:?}");
+                    if shared.closed_at.is_none() {
+                        shared.closed_at = Some(event_gate.start.get().unwrap().elapsed());
+                    }
+                    break;
+                }
             }
         }
     });
@@ -285,8 +403,8 @@ async fn main() {
         opts
     };
 
-    let deadline = Instant::now() + duration;
-    let run_started_at = Instant::now();
+    let run_started_at = gate.wait().await;
+    let deadline = run_started_at + duration;
     let mut submitters = Vec::with_capacity(parallel);
     for _ in 0..parallel {
         let conn = conn.clone();
@@ -294,7 +412,6 @@ async fn main() {
         let message = message.clone();
         let shared = shared.clone();
         submitters.push(tokio::spawn(async move {
-            let mut sample_counter = 0u64;
             while Instant::now() < deadline {
                 let started_at = Instant::now();
                 match conn.submit(&opts, &message, None).await {
@@ -309,8 +426,7 @@ async fn main() {
                         }
                         // 延迟采样：仅 1/64 的批次记录入队时刻，把事件消费者的
                         // per-event 开销降到最低（饱和场景下消费者必须跟上速率）。
-                        sample_counter += 1;
-                        if sample_counter % 64 == 0 {
+                        if shared.submit_calls % 64 == 0 {
                             shared
                                 .submitted
                                 .extend(sequence_ids.iter().map(|&id| (id, enqueued_at)));
@@ -318,7 +434,17 @@ async fn main() {
                     }
                     Err(e) => {
                         let mut shared = shared.lock().unwrap();
-                        if matches!(e, cmppprotocol::Error::ResourceExhausted(_)) {
+                        let cause = match &e {
+                            cmppprotocol::Error::PartialSubmit {
+                                sequence_ids,
+                                source,
+                            } => {
+                                shared.segments += sequence_ids.len() as u64;
+                                source.as_ref()
+                            }
+                            other => other,
+                        };
+                        if matches!(cause, cmppprotocol::Error::ResourceExhausted(_)) {
                             // UDH reference 池按 (src_id, dest) 分域，每域 256 个
                             // reference 释放后默认进入 300s cooldown——长短信持续
                             // 速率受此约束，这是防重组错误的刻意设计。
@@ -337,9 +463,11 @@ async fn main() {
         }));
     }
     for handle in submitters {
-        let _ = handle.await;
+        handle.await.expect("submitter panic");
     }
 
+    // 即使纯 DELIVER 或 UDH 提前耗尽，也观测完整配置时长。
+    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
     // 等待在途 segment 全部终结。
     let drain_deadline = deadline + delay * 8 + Duration::from_secs(10);
     loop {
@@ -350,18 +478,33 @@ async fn main() {
                 shared.responses + shared.timeouts + shared.drops,
             )
         };
-        if finished >= segments || Instant::now() > drain_deadline {
+        if finished >= segments
+            || shared.lock().unwrap().closed_at.is_some()
+            || Instant::now() > drain_deadline
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // DELIVER 发出端在 deadline 后停止补充；给最后一个窗口留出收尾时间。
+    if deliver_window > 0
+        && tokio::time::timeout(Duration::from_secs(5), deliver_drained.notified())
+            .await
+            .is_err()
+    {
+        eprintln!("connection={index}: DELIVER drain timeout");
+    }
     let metrics = conn.metrics();
     conn.close().await;
-    let _ = event_task.await;
-    let _ = server.await;
+    event_task.await.expect("event consumer panic");
+    let gateway = server.await.expect("mock gateway panic");
 
-    let shared = shared.lock().unwrap();
+    let shared = Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
+    println!(
+        "connection={index} deliver_sent={} deliver_acked={} deliver_events={}",
+        gateway.deliver_sent, gateway.deliver_acked, shared.delivers
+    );
     let elapsed = duration.as_secs_f64();
     println!("----------------------------------------");
     println!(
@@ -379,7 +522,7 @@ async fn main() {
     );
     if let Some(closed_at) = shared.closed_at {
         println!(
-            "⚠ 连接在 {:.1?} 后被有界关闭（事件消费者未跟上饱和速率），吞吐按全程 {}s 折算",
+            "⚠ 连接在 {:.1?} 后提前关闭（原因见 stderr），吞吐按全程 {}s 折算",
             closed_at, elapsed
         );
     }
@@ -399,7 +542,7 @@ async fn main() {
         sorted.sort();
         let average: Duration = sorted.iter().sum::<Duration>() / sorted.len() as u32;
         println!(
-            "端到端延迟: avg={:.1?} p50={:.1?} p95={:.1?} p99={:.1?} max={:.1?}",
+            "入队返回后响应延迟（抽样，快速响应可能漏样）: avg={:.1?} p50={:.1?} p95={:.1?} p99={:.1?} max={:.1?}",
             average,
             percentile(&sorted, 50.0),
             percentile(&sorted, 95.0),
@@ -427,4 +570,107 @@ async fn main() {
         "writer: batches={} frames={} average_batch={:.2} event_depth_peak={}",
         metrics.write_batches, metrics.write_frames, average_batch, metrics.event_depth_peak
     );
+    (shared, metrics, gateway)
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
+    let args = parse_args();
+    let budget = Duration::from_secs(arg_u64(&args, "duration", 10) + 60);
+    tokio::time::timeout(budget, run_all(args))
+        .await
+        .expect("loadtest exceeded time budget");
+}
+
+async fn run_all(args: HashMap<String, String>) {
+    let connections = arg_u64(&args, "connections", 1) as usize;
+    assert!((1..=128).contains(&connections));
+    let gate = Arc::new(RunGate {
+        ready: Barrier::new(connections * 2 + 1),
+        go: Barrier::new(connections * 2 + 1),
+        start: OnceLock::new(),
+        duration: Duration::from_secs(arg_u64(&args, "duration", 10)),
+    });
+    let mut jobs = tokio::task::JoinSet::new();
+    for index in 0..connections {
+        jobs.spawn(run_connection(args.clone(), gate.clone(), index));
+    }
+    tokio::select! {
+        _ = gate.ready.wait() => {}
+        result = jobs.join_next() => { let _ = result.expect("missing connection task").expect("connection setup failed"); panic!("connection ended before start"); }
+    }
+    let instrumented = arg_u64(&args, "alloc", 0) == 1;
+    allocation_meter::enable(instrumented);
+    let started = Instant::now();
+    gate.start.set(started).unwrap();
+    gate.go.wait().await;
+    let mut segments = 0;
+    let mut responses = 0;
+    let mut delivers = 0;
+    let mut sent = 0;
+    let mut acked = 0;
+    let mut retries = 0;
+    let mut lost = 0;
+    let mut timeouts = 0;
+    let mut closed = 0;
+    let mut exhausted = 0;
+    let mut latencies = Vec::new();
+    let mut deliver_latencies = Vec::new();
+    while let Some(job) = jobs.join_next().await {
+        let (s, m, g) = job.expect("connection runner panic");
+        segments += s.segments;
+        responses += s.responses;
+        delivers += s.delivers;
+        sent += g.deliver_sent;
+        acked += g.deliver_acked;
+        retries += m.submit_retries;
+        lost += m.events_dropped + s.drops;
+        timeouts += s.timeouts;
+        closed += usize::from(s.closed_at.is_some());
+        exhausted += usize::from(s.udh_exhausted);
+        latencies.extend(s.latencies);
+        deliver_latencies.extend(s.deliver_latencies);
+    }
+    allocation_meter::enable(false);
+    let (allocations, bytes) = allocation_meter::snapshot();
+    latencies.sort_unstable();
+    deliver_latencies.sort_unstable();
+    println!(
+        "DELIVER_LATENCY samples={} p50_us={} p95_us={} p99_us={}",
+        deliver_latencies.len(),
+        percentile(&deliver_latencies, 50.0).as_micros(),
+        percentile(&deliver_latencies, 95.0).as_micros(),
+        percentile(&deliver_latencies, 99.0).as_micros()
+    );
+    println!(
+        "RESULT connections={} segments={} responses={} submit_rate={:.0} deliver_sent={} deliver_acked={} delivers={} deliver_rate={:.0} retries={} loss_signals={} timeouts={} closed={} exhausted={} latency_samples={} p50_us={} p95_us={} p99_us={} observed_secs={:.3} alloc_enabled={} allocations={} allocated_bytes={}",
+        connections,
+        segments,
+        responses,
+        responses as f64 / gate.duration.as_secs_f64(),
+        sent,
+        acked,
+        delivers,
+        delivers as f64 / gate.duration.as_secs_f64(),
+        retries,
+        lost,
+        timeouts,
+        closed,
+        exhausted,
+        latencies.len(),
+        percentile(&latencies, 50.0).as_micros(),
+        percentile(&latencies, 95.0).as_micros(),
+        percentile(&latencies, 99.0).as_micros(),
+        started.elapsed().as_secs_f64(),
+        instrumented,
+        allocations,
+        bytes
+    );
+    assert_eq!(
+        segments, responses,
+        "incomplete successful SUBMIT responses"
+    );
+    assert_eq!((lost, timeouts, closed), (0, 0, 0), "unhealthy run");
+    assert_eq!(sent, acked, "DELIVER acknowledgements missing");
+    assert_eq!(acked, delivers, "DELIVER events missing");
 }
