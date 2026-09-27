@@ -2,12 +2,13 @@
     [int]$Duration = 3,
     [int]$Repeats = 2,
     [string]$OutputDirectory = "target/performance-matrix",
-    [string]$Only = ""
+    [string]$Only = "",
+    [string]$BinaryPath = ""
 )
 $ErrorActionPreference = "Stop"
 if ($Duration -lt 1 -or $Repeats -lt 1) { throw "Duration and Repeats must be positive" }
 $root = Split-Path $PSScriptRoot -Parent
-$binary = Join-Path $root "target/release/examples/loadtest.exe"
+$binary = if ($BinaryPath) { [IO.Path]::GetFullPath((Join-Path $root $BinaryPath)) } else { Join-Path $root "target/release/examples/loadtest.exe" }
 if (!(Test-Path -LiteralPath $binary)) { throw "Run cargo build --release --example loadtest first" }
 $output = [IO.Path]::GetFullPath((Join-Path $root $OutputDirectory))
 New-Item -ItemType Directory -Force -Path $output | Out-Null
@@ -84,7 +85,16 @@ foreach ($scenario in $scenarios) {
         $row = [ordered]@{ scenario=$scenario.Name; round=$round; arguments=$arguments; exit_code=$process.ExitCode; wall_seconds=$timer.Elapsed.TotalSeconds; cpu_seconds=$cpuSeconds; average_cpu_cores=$cpuSeconds/$timer.Elapsed.TotalSeconds; sampled_peak_working_set_bytes=$peakWorkingSet }
         foreach ($key in "connections segments responses submit_rate deliver_sent deliver_acked delivers deliver_rate retries loss_signals timeouts closed exhausted latency_samples p50_us p95_us p99_us observed_secs alloc_enabled allocations allocated_bytes deliver_samples deliver_p50_us deliver_p95_us deliver_p99_us".Split(" ")) { $row[$key] = $null }
         $row["event_depth_peak_max"] = 0L
+        $row["first_close_ms"] = $null
+        $row["submit_unanswered"] = $null
+        $row["deliver_unacked"] = $null
+        $row["deliver_unconsumed"] = $null
         foreach ($line in (Get-Content -LiteralPath "$prefix.log")) {
+            if ($line -match '连接在 ([0-9.]+)(ns|µs|μs|us|ms|s) 后') {
+                $scale = if ($Matches[2] -eq "s") {1000.0} elseif ($Matches[2] -eq "ms") {1.0} elseif ($Matches[2] -eq "ns") {0.000001} else {0.001}
+                $closedMs = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture) * $scale
+                if ($null -eq $row["first_close_ms"] -or $closedMs -lt $row["first_close_ms"]) { $row["first_close_ms"] = $closedMs }
+            }
             if ($line -match "event_depth_peak=(\d+)") {
                 $row["event_depth_peak_max"] = [Math]::Max($row["event_depth_peak_max"], [long]$Matches[1])
             }
@@ -100,6 +110,11 @@ foreach ($scenario in $scenarios) {
                     $row["deliver_" + $kv[0]] = $kv[1]
                 }
             }
+        }
+        if ($null -ne $row["responses"]) {
+            $row["submit_unanswered"] = [long]$row["segments"] - [long]$row["responses"]
+            $row["deliver_unacked"] = [long]$row["deliver_sent"] - [long]$row["deliver_acked"]
+            $row["deliver_unconsumed"] = [long]$row["deliver_sent"] - [long]$row["delivers"]
         }
         $rows += [pscustomobject]$row
         $rows | Export-Csv -LiteralPath (Join-Path $output "results.csv") -NoTypeInformation -Encoding UTF8

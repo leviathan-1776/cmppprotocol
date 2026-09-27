@@ -1,0 +1,59 @@
+--- a/src/connection.rs
++++ b/src/connection.rs
+@@ -2347,2 +2347,12 @@
+-    while let Some(item) = event_spool_rx.recv().await {
++    let mut batch = Vec::with_capacity(32);
++    loop {
++        if batch.is_empty() {
++            if event_spool_rx.recv_many(&mut batch, 32).await == 0 {
++                break;
++            }
++            // reverse + pop 保持 FIFO 并复用同一缓冲；未处理工单继续持有深度许可。
++            batch.reverse();
++        }
++        let item = batch.pop().expect("nonempty dispatcher batch");
++        tokio::task::consume_budget().await;
+         match item {
+@@ -2377,3 +2387,3 @@
+             EventSpoolItem::Event {
+-                event_rx,
++                mut event_rx,
+                 _depth_permit,
+@@ -2386,3 +2396,15 @@
+                 }
+-                let event = match event_rx.await {
++                // 已由 writer 发布的事件不再消耗一次异步 oneshot 接收预算。
++                // 尚未写出确认时仍等待当前工单，不能越过它发布后续事件。
++                let ready = match event_rx.try_recv() {
++                    Ok(event) => Ok(event),
++                    Err(oneshot::error::TryRecvError::Empty) => event_rx.await,
++                    Err(oneshot::error::TryRecvError::Closed) => {
++                        if let Some(inner) = inner.upgrade() {
++                            inner.events_dropped.fetch_add(1, Ordering::Relaxed);
++                        }
++                        continue;
++                    }
++                };
++                let event = match ready {
+                     Ok(event) => event,
+@@ -2808,2 +2830,3 @@
+     let mut local_terminate_acked = false;
++    let mut decoded_since_checkpoint = 0usize;
+     let reason: Error = 'outer: loop {
+@@ -2812,2 +2835,13 @@
+         loop {
++            if decoded_since_checkpoint == 64 {
++                // 发布当前批次后，仅在高积压时让 writer/dispatcher 获得运行机会。
++                // 不持锁等待，不等待深度下降；持续背压仍走原有的有界关闭路径。
++                flush_submit_resps(&inner, &mut pending_resps);
++                decoded_since_checkpoint = 0;
++                if inner.event_depth.current.load(Ordering::SeqCst)
++                    >= inner.event_spool_capacity.div_ceil(2)
++                {
++                    tokio::task::yield_now().await;
++                }
++            }
+             if *phase_rx.borrow() == ConnectionPhase::Closed {
+@@ -2827,1 +2861,2 @@
++            decoded_since_checkpoint += 1;
+             let Frame { sequence_id, pdu } = frame;

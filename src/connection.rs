@@ -3564,3 +3564,6 @@ mod performance_config_tests {
         assert!(matches!(rx.recv().await, Some(Event::Disconnected(_))));
     }
 }
+
+#[cfg(test)]
+mod burst_tests;
