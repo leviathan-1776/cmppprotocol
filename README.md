@@ -1,30 +1,41 @@
 # cmppprotocol
 
-面向 Rust 的 **CMPP 2.0 client** protocol library，用于通过长连接 TCP link 将 Service Provider (SP) 连接到CMPP ISMG。
+一个基于 Rust 和 Tokio 的 CMPP 2.0 客户端协议库，用于通过 TCP 长连接连接短信网关（ISMG），发送短信并接收短信上行和状态报告。
 
-## 功能特性
+## 功能概览
 
-- **Typed PDU model** (`pdu`)：每一种 CMPP 2.0 message 都是 strongly typed struct，
-统一收敛到 `Pdu` enum，并支持二进制 `encode`/`decode`。
-- **Async codec** (`CmppFrameCodec`)：基于 `tokio_util` 的 `Decoder`/`Encoder`，
-处理 TCP framing（半包/不完整包、长度校验），并产出 `Frame { sequence_id, pdu }`。
-- **Async connection** (`CmppConnection`)：
-  - `connect()` 完成登录 handshake，并在返回前校验 ISMG 的 `AuthenticatorISMG`。
-  - `submit()` 是 **non-blocking**：它应用 sliding-window backpressure，并立即返回分片的
-  sequence id（符合 CMPP pipeline、async 的特性）。
-          - 所有响应都会以 `Event` 形式从 `take_events()` channel 到达：`SubmitResp`、
-  `SubmitTimeout`、`SubmitDropped`（连接在收到响应前拆除）、`Deliver`（status reports / MO）
-  和 `Disconnected`。自动重传、
-  ACTIVE_TEST heartbeat 和优雅的 TERMINATE teardown 都在内部处理。
-- **Charset & long SMS** (`encoding`)：支持 ASCII/UCS2 编码和 6-byte UDH 拼接，
-保留字符边界（包括 UTF-16 surrogate 边界）。
-- **Ergonomic submit** (`SubmitOptions`)：所有 SUBMIT 字段都可配置并带有合理默认值；
-long message 会被拆分为多个分片。
+- 支持 CMPP 2.0 客户端登录和连接管理。
+- 支持发送普通短信和长短信。
+- 支持 ASCII、UCS2 编码以及中文短信。
+- 支持接收短信上行（MO）和状态报告（Report）。
+- 通过事件接收发送结果、上行消息、状态报告和连接状态变化。
+- 自动处理心跳、连接关闭以及发送响应超时。
+
+## 环境要求
+
+- Rust 1.85 或更高版本
+- 支持 Tokio 的异步运行时
+- 可访问 CMPP 2.0 ISMG 网关
+
+## 添加依赖
+
+在项目的 `Cargo.toml` 中添加：
+
+```toml
+[dependencies]
+cmppprotocol = { path = "../cmppprotocol" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+如果使用已发布的 crate，也可以将 `path` 替换为对应的版本号。
 
 ## 快速开始
 
 ```rust,no_run
-use cmppprotocol::{CmppConnection, CmppConfig, CmppProtocolParams, Event, SubmitOptions};
+use cmppprotocol::{
+    CmppConfig, CmppConnection, CmppProtocolParams, Event, SubmitOptions,
+    CMPP_VERSION_20,
+};
 
 #[tokio::main]
 async fn main() -> cmppprotocol::Result<()> {
@@ -33,163 +44,117 @@ async fn main() -> cmppprotocol::Result<()> {
         port: 7890,
         account: "901234".into(),
         password: "secret".into(),
-        version: cmppprotocol::CMPP_VERSION_20,
+        version: CMPP_VERSION_20,
         protocol_params: CmppProtocolParams::default(),
     };
 
-    let conn = CmppConnection::connect(config).await?;
+    let connection = CmppConnection::connect(config).await?;
+    let mut events = connection
+        .take_events()
+        .await
+        .expect("事件接收器只能获取一次");
 
-    let mut events = conn.take_events().await.expect("events 首次可用");
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             match event {
                 Event::SubmitResp { sequence_id, result, .. } => {
-                    println!("响应 seq={} result={}", sequence_id, result);
+                    println!("短信响应：seq={sequence_id}，result={result}");
                 }
                 Event::Deliver(deliver) => {
                     if let Some(report) = deliver.report() {
-                        println!("报告 {} -> {}", report.msg_id_hex(), report.stat);
+                        println!("状态报告：{} -> {}", report.msg_id_hex(), report.stat);
+                    } else {
+                        println!("收到短信上行");
                     }
                 }
-                Event::SubmitTimeout { sequence_id, attempts } => {
-                    println!("超时 seq={}（已尝试 {} 次，可能重复下发）", sequence_id, attempts)
+                Event::SubmitTimeout { sequence_id, attempts, .. } => {
+                    println!("短信响应超时：seq={sequence_id}，尝试次数={attempts}");
                 }
                 Event::SubmitDropped { sequence_id } => {
-                    println!("连接断开，未收到响应 seq={}", sequence_id)
+                    println!("连接关闭，未收到响应：seq={sequence_id}");
                 }
-                Event::Disconnected(e) => { println!("连接已断开: {}", e); break; }
+                Event::Disconnected(reason) => {
+                    println!("连接断开：{reason}");
+                    break;
+                }
             }
         }
     });
 
-    // submit() 是 non-blocking，并返回各分片的 sequence id。
-    let opts = SubmitOptions::new("SVC", "901234", "10690001", "13800138000");
-    let seq_ids = conn.submit(&opts, "Hello World", None).await?;
-    println!("已提交 {} 个分片", seq_ids.len());
-
-    conn.close().await;
+    let options = SubmitOptions::new("SVC", "901234", "10690001", "13800138000");
+    connection.submit(&options, "Hello World", None).await?;
+    connection.close().await;
     Ok(())
 }
 ```
 
-可运行的 CLI 示例见 `examples/send_sms.rs`。
+`submit` 返回各短信分片对应的序列号。它只表示短信已经交给连接处理，最终结果需要继续通过事件接收器判断。
 
-## 语义保证与运维注意事项
-
-- **终态交付边界**：消费者持续消费且未触发事件丢弃时，每个被 `submit()` 接受的
-  sequence id 恰好会收到一个终态事件——
-  `SubmitResp`（收到响应）、`SubmitTimeout`（重试预算耗尽）或 `SubmitDropped`
-  （连接在收到响应前被拆除）。背压超时、接收端关闭或拆连投递预算耗尽时允许丢失，
-  并计入 `events_dropped`。调用方须记录已接受的 seq；缺失终态表示“结果未知”，
-  不能直接视为发送失败重发。`SubmitDropped` 也不代表网关未受理。
-- **Disconnected 事件语义**：调用方主动 `close()` 的优雅关闭以事件通道结束
-  （`recv()` 返回 `None`）表达，不发布 `Disconnected` 事件；`Disconnected`
-  仅在异常拆除（I/O 错误、超时、对端 TERMINATE、事件积压有界关闭）时发布
-  并携带原因。
-- **at-least-once 重传**：`SUBMIT_RESP` 丢失但 ISMG 实际已受理时，同 sequence id
-  的重传可能导致网关侧重复计费/重复下发。业务侧应按 `msg_id` 做幂等。
-  `Event::SubmitTimeout` 携带完整写出次数 `attempts`（含首次：首次为 1，重传两次为 3），
-  写出不代表网关已接收，次数越大重复风险越高。
-- **错误可重试性**：`Error::is_retryable()` 区分瞬态失败（`Io`/`Timeout`/
-  `Closed`/`ResourceExhausted` 等，重连或退避后可重试）与持久失败（`Auth`/
-  `Decode`/`Config` 等，重试前需修正根因）。UDH 引用池耗尽属于
-  `ResourceExhausted`（瞬态，受 cooldown 约束）。可重试不代表重发安全或必然成功；
-  `PartialSubmit` 的未入队部分与已入队部分须分开处理。
-- **未确认 DELIVER**：`Event::Deliver` 仅在对应 `DELIVER_RESP` 已完整写到 socket 后
-  才会发布。若连接在确认前异常拆除，该 DELIVER 会被丢弃且不会发布事件——
-  多数 ISMG 会在重连后重推未确认的 DELIVER，依赖此行为的应用无需额外处理，
-  不能依赖的应用应在 `Disconnected` 后自行容忍可能的重复。
-- **长短信部分提交**：多 segment 长短信逐段发送；若中途连接关闭，`submit()`
-  返回 `Error::PartialSubmit` 并携带已入队 segment 的 sequence id（适用上述终态
-  交付边界），但终端不会重组出完整短信。调用方可据此重发未入队部分
-  或整体重发（新连接 + 新 UDH reference）。
-- **事件消费必须常驻且快速**：event channel 可用容量不足、持续阻塞投递超过配置预算（默认 1 秒）会触发
-  有界关闭（`Disconnected(ChannelClosed)`；若连接已因其他原因关闭则保留原原因），
-  后续事件进入丢弃模式；不保证整个关闭流程恰好在 1 秒内完成。请把事件循环放在
-  独立 task 中持续消费。
-- **运行时 metrics**：`conn.metrics()` 返回 `ConnectionMetrics` 快照
-  （admitted / responses / retries / timeouts / delivers / dropped events /
-  in-flight），适合周期性采集用于监控与容量评估。
-- **窗口大小**：`window_size` 默认 16，硬上限 16384。超过 256 时 `connect()`
-  会输出 warning——多数 ISMG 的单连接窗口上限为 256，请先确认网关配置。
-  单连接吞吐约为 `window_size / RTT`。
-
-## 性能
-
-本轮完整核验见 [性能核验记录](docs/performance-validation.md)。消息号格式化微基准耗时约减少
-93.4%；这不代表短信吞吐提升。后续事件投递快速路径在默认 spool=256 下通过三轮短测和
-20 秒饱和 loopback（约 38.4 万分片/秒，零丢弃）。默认容量与背压关闭约定保持不变，
-这些本地测试不构成任意负载下不积压的保证。
-
-运行时 metrics（`conn.metrics()`）提供 admitted / responses / retries / timeouts /
-delivers / dropped events / in-flight 计数，适合接入监控系统。
-
-`CmppProtocolParams` 提供以下调优参数，默认设置延续此前行为：
-
-| 参数 | 默认值 | 含义 |
-|---|---|---|
-| `event_backpressure_timeout_ms` | 1000 | 公开事件通道投递等待预算，毫秒，须大于 0 |
-| `event_spool_capacity` | 256 | 普通 spool 槽数，1–16384；实际至少 `ceil(window_size / 128)`，另留 2 个紧急槽 |
-| `write_batch_max_frames` | 64 | 每批最多协议帧数，1–16384 |
-| `write_batch_max_bytes` | 65536 | 组批字节阈值，须大于 0；完整加入最后一帧后可超出阈值 |
-| `tcp_nodelay` | true | TCP_NODELAY 开关 |
-| `tcp_keepalive_secs` | Some(60) | keepalive 空闲秒数，None 禁用 |
-| `tcp_keepalive_interval_secs` | 10 | keepalive 探测间隔秒数，启用时须大于 0 |
-
-keepalive 秒数换算毫秒后不得超过 `u32::MAX`；TCP 选项设置失败沿用告警并继续运行的行为。
-完整列出所有字段的配置初始化需补充新字段，也可使用 `..CmppProtocolParams::default()`。
-spool 容量按工单计，拆连批次每个工单最多含 128 个事件；增大容量不提供无条件终态必达保证。
-
-新增 `write_batches` / `write_frames` 统计握手后成功完整写出的批次与帧数，包含控制帧和重传，
-失败批次不计入。平均批大小为 `write_frames / write_batches`（批次数为 0 时取 0）。
-`event_depth_peak` 是内部工单持有事件数的峰值，包含 dispatcher 当前工单、尝试入队的工单和
-Terminal，批次按事件数计，不包含公开事件通道缓存。指标独立采样，运行中的快照不是原子快照。
-
-### 微基准
+可运行示例：
 
 ```bash
-cargo bench --bench protocol
+cargo run --example send_sms
 ```
 
-覆盖 PDU encode/decode、codec framing 和长短信拆分（参考量级：SUBMIT 编码
-~0.5µs、解码 ~0.4µs、8 段长短信拆分 ~3µs）。
+## 发送短信
 
-### 端到端压测
+使用 `SubmitOptions::new` 设置常用的发送字段，再调用 `submit`：
 
-`examples/loadtest.rs` 内置进程内 mock ISMG（可配置 RTT），测量稳态吞吐、
-延迟分位与窗口回压：
-
-```bash
-cargo run --release --example loadtest -- duration=6 window=256 delay_ms=50 parallel=8
-# 长短信（8 段）+ 自定义 UDH cooldown：
-cargo run --release --example loadtest -- duration=6 long=1 udh_cooldown_ms=500
-# 对比组批与事件配置（输出平均批大小及内部事件深度峰值）：
-cargo run --release --example loadtest -- duration=6 window=256 delay_ms=0 parallel=8 batch_frames=64 batch_bytes=65536 spool_capacity=256 event_timeout_ms=1000
+```rust,no_run
+let options = SubmitOptions::new("SVC", "901234", "10690001", "13800138000");
+let sequence_ids = connection.submit(&options, "这是一条短信", None).await?;
+println!("已提交 {} 个短信分片", sequence_ids.len());
 ```
 
-新增多连接、DELIVER、分配统计及 Windows CPU 测量脚本，见
-[扩展测量报告](docs/performance-matrix-2026-09-27.md)。当前模拟网关默认开启 TCP_NODELAY，
-可用 `server_nodelay=0` 复现旧网关配置；CPU/分配统计包含进程内网关与压测程序。
+短信内容较长时，库会自动进行分片并使用 UDH 组织成长短信。调用方仍应根据业务需要限制内容长度，并为发送结果做好重试或人工处理安排。
 
-历史实测参考（Windows，单连接；不代表本轮改动已取得相同吞吐或提升）：
+如果需要设置更多 SUBMIT 字段，可以在 `SubmitOptions` 上继续配置；未配置的字段使用库提供的默认值。
 
-| 场景 | 实测吞吐 | 说明 |
-|---|---|---|
-| loopback，RTT≈0，window=256 | ~368k segments/s | 受事件消费管线限制，库零丢弃 |
-| RTT 50ms，window=256 | ~4.1k segments/s | 与 `window/RTT` 模型一致（62.8ms 实测 RTT） |
-| RTT 50ms，window=16 | ~259 segments/s | 同上 |
-| 8 段长短信，cooldown 500ms | ~258 条/s | 受窗口限制；默认 300s cooldown 时为 ~0.85 条/s/目的地 |
+## 接收事件
 
-**长短信 UDH cooldown 约束**：同一 `(Src_Id, Dest_Terminal_Id)` 重组域只有 256 个
-8-bit reference，释放后默认进入 300s cooldown（防网关/终端错误重组）。对同一
-目的地的高频长短信场景，请通过 `connect_with_udh_reference_cooldown` 调低。
-cooldown 状态不跨进程存活；UDH reference 起点在每次启动时随机化，降低重启后
-与重启前在途分片撞号的概率。
+事件接收器需要持续消费，常见事件包括：
 
-## 范围
+- `Event::SubmitResp`：收到短信网关响应，可根据 `result` 判断发送结果。
+- `Event::SubmitTimeout`：等待响应超时，表示结果可能未知，不应直接认定网关未受理。
+- `Event::SubmitDropped`：连接关闭前没有收到响应。
+- `Event::Deliver`：收到短信上行或状态报告。
+- `Event::Disconnected`：连接异常断开，并携带断开原因。
 
-这个 crate 仅实现 **CMPP 2.0** 的 **client** 侧。重连逻辑有意交给调用方处理
-（connection 会暴露清晰的错误和 closed 状态）。CMPP 3.0 以及 ISMG/server 角色不在范围内。
+建议在独立的 Tokio task 中持续处理事件，并在业务侧记录序列号、手机号和消息内容等必要信息。
+
+主动调用 `close()` 时，事件流会正常结束；异常断开时通常会收到 `Disconnected`。断线重连需要由调用方根据业务场景实现。
+
+## 配置连接
+
+`CmppConfig` 主要包含以下信息：
+
+| 字段 | 说明 |
+| --- | --- |
+| `host` | ISMG 主机地址 |
+| `port` | ISMG 端口 |
+| `account` | SP 账号 |
+| `password` | SP 密码 |
+| `version` | CMPP 协议版本，CMPP 2.0 使用 `CMPP_VERSION_20` |
+| `protocol_params` | 协议连接参数，通常使用 `CmppProtocolParams::default()` |
+
+登录失败、配置错误、网络错误和协议解析错误都会通过 `Result` 或事件返回，调用方应记录错误并根据错误类型决定是否重连。
+
+## 使用建议
+
+1. 连接建立后尽快启动事件消费任务。
+2. 为每次发送保存返回的序列号，结合事件记录最终处理结果。
+3. 超时或连接断开时，先确认业务是否允许重发，避免产生重复短信。
+4. 断线后重新创建连接并重新登录，不要继续使用已经关闭的连接。
+5. 对状态报告和短信上行做好幂等处理，因为网关可能在重连后再次推送未确认消息。
+
+## 项目范围
+
+本项目仅实现 CMPP 2.0 的客户端侧能力，不包含：
+
+- CMPP 3.0；
+- ISMG 服务端；
+- 自动重连策略；
+- 业务层的短信模板、计费和消息幂等服务。
 
 ## 许可证
 
