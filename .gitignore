@@ -33,4 +33,7 @@ rust-project.json
 *.pdf
 
 ### logs
-logs/.zcode/
+docs
+examples
+scripts
+tests

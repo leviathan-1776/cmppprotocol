@@ -1,8 +1,0 @@
-{
-  "LogicalProcessors": 16,
-  "Scope": "Whole process: client + mock gateway + harness; allocation rounds separate",
-  "Repeats": 1,
-  "Duration": 10,
-  "Timestamp": "2026-09-27T10:23:06.2894169+08:00",
-  "BinarySha256": "98DDE815ADA45153FA115C8AB30FBD300FBF08430A0C8F889C4B40F9E182E8CA"
-}
