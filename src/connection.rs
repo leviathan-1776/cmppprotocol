@@ -948,7 +948,11 @@ impl Inner {
             }
             pending
                 .drain()
-                .map(|(sequence_id, _)| sequence_id)
+                .filter_map(|(sequence_id, entry)| {
+                    // 响应路径已接管终态及发布失败计数；writer 尚未收尾不能再补发关闭终态。
+                    (!matches!(entry.state, SubmitAttemptState::RespondedWhileWriting { .. }))
+                        .then_some(sequence_id)
+                })
                 .collect()
         };
         let retry_deadline = Instant::now() + TEARDOWN_EVENT_RETRY_BUDGET;
